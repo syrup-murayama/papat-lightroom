@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使い方の質問・アカウント・請求 / Usage, account, or billing
+    url: mailto:hello@papat.app
+    about: hello@papat.app にメールしてください / Email hello@papat.app
+  - name: 脆弱性の報告 / Report a vulnerability
+    url: https://github.com/syrup-murayama/papat-lightroom/blob/main/SECURITY.md
+    about: 公開 Issue に書かず、SECURITY.md の手順をご覧ください / Do not use a public issue; follow SECURITY.md

@@ -1,0 +1,54 @@
+name: 不具合の報告 / Bug report
+description: papat プラグインの不具合を報告する / Report a papat plug-in bug
+title: "[不具合 / Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **公開 Issue に API キー・パスコード・ギャラリー URL・クライアント名・写真を貼らないでください。**
+        **Do not post API keys, passcodes, gallery URLs, client names, or photos in a public issue.**
+  - type: input
+    id: papat-version
+    attributes:
+      label: papat プラグインの版 / papat plug-in version
+      placeholder: "1.0.3"
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS の版 / macOS version
+    validations:
+      required: true
+  - type: input
+    id: lightroom-version
+    attributes:
+      label: Lightroom Classic の版 / Lightroom Classic version
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 起きたこと / What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待したこと / What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現の手順 / Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログの該当行 / Relevant log lines
+      description: 秘密や個人情報を除いてください。/ Remove secrets and personal information.
+    validations:
+      required: false

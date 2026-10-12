@@ -1,0 +1,46 @@
+papat for Lightroom Classic — はじめにお読みください
+=====================================================
+
+このフォルダには papat.lrplugin（プラグイン本体）が入っています。
+Lightroom Classic（macOS）に、次の手順で追加します。
+
+■ インストール（3分）
+
+1. papat.lrplugin を「消さない場所」に置きます。
+   おすすめ:  書類 › Lightroom プラグイン
+   （「書類」フォルダの中に「Lightroom プラグイン」フォルダを作って、その中へ）
+   ※ ダウンロードフォルダのままだと、整理したときに消えてしまい、papat が使えなくなります。
+
+2. Lightroom Classic を開き、メニューの
+   ファイル › プラグインマネージャー を開きます。
+
+3. 左下の「追加」を押して、置いた papat.lrplugin を選びます。
+   （フォルダごと選びます。中のファイルではありません）
+
+4. 一覧に「papat」が出て「インストール済みで実行中」になれば完了です。
+   「API キー」の欄に、papat のダッシュボード（https://papat.app/app）で
+   発行したキーを貼り付けて「保存」→「接続を確認」を押します。
+   API キーは他の人に見せたり、チャットやメールに貼ったりしないでください。
+
+■ 置き場所に迷ったら
+
+「追加」したあとで、プラグインマネージャーの papat の画面にある
+「標準の場所にコピー…」を押すと、Lightroom の標準の場所
+（~/Library/Application Support/Adobe/Lightroom/Modules/）へ papat が自分でコピーされます。
+Lightroom を再起動すれば、もとの papat.lrplugin は削除しても大丈夫です。
+（再起動後、プラグインマネージャーに papat が2つ並んでいたら、もとの場所のほうを「削除」してください）
+
+■ 困ったとき
+
+https://papat.app/lightroom/ ／ hello@papat.app
+
+-----------------------------------------------------
+
+English (short)
+
+1. Put papat.lrplugin somewhere it will stay (e.g. Documents › Lightroom Plugins).
+   Don't leave it in Downloads.
+2. In Lightroom Classic: File › Plug-in Manager › Add, and choose papat.lrplugin.
+3. Paste your API key (https://papat.app/app) in the papat panel, then Save.
+Or: after adding it, press "標準の場所にコピー…" in the papat panel to copy it to
+~/Library/Application Support/Adobe/Lightroom/Modules/ — then you can delete the original folder.

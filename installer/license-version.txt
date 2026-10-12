@@ -1,0 +1,8 @@
+# Version of the installer's licence text ("使用許諾"). One number for every language.
+#
+# Change ANY character of installer/resources/*.lproj/license.html (or of LICENSE) =>
+#   1. raise `version`, set `date` (the day the new text is published),
+#   2. add the row to docs/license-history.md (scripts/check-license.sh prints the hashes).
+# scripts/check.sh and scripts/verify-pkg.sh fail when the text changed under the same version.
+version=1
+date=2026-10-12

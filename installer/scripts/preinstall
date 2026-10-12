@@ -1,0 +1,40 @@
+#!/bin/sh
+# papat for Lightroom Classic — preinstall
+#
+# Runs as the logged-in user ("Install for me only"; no administrator rights).
+# If a papat.lrplugin is already in Lightroom's Modules folder it is MOVED (not
+# deleted) to a backups folder next to Modules before the new files are placed, so a
+# stale file from an older version can never linger and nothing is lost.
+set -u
+
+if [ "$(id -u)" = "0" ]; then
+  echo "papat installer: this installer is for the current user only; not running as root." >&2
+  exit 1
+fi
+
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+  echo "papat installer: cannot determine the home directory." >&2
+  exit 1
+fi
+
+LIGHTROOM="$HOME/Library/Application Support/Adobe/Lightroom"
+MODULES="$LIGHTROOM/Modules"
+TARGET="$MODULES/papat.lrplugin"
+BACKUPS="$LIGHTROOM/papat-lightroom-backups"
+
+mkdir -p "$MODULES" || exit 1
+
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+  mkdir -p "$BACKUPS" || exit 1
+  STAMP="$(date +%Y%m%d-%H%M%S)"
+  DEST="$BACKUPS/papat.lrplugin.$STAMP"
+  N=0
+  while [ -e "$DEST" ]; do
+    N=$((N + 1))
+    DEST="$BACKUPS/papat.lrplugin.$STAMP-$N"
+  done
+  mv "$TARGET" "$DEST" || exit 1
+  echo "papat installer: previous version moved to $DEST"
+fi
+
+exit 0

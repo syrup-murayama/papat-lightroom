@@ -1,0 +1,15 @@
+#!/bin/sh
+# papat for Lightroom Classic — postinstall
+#
+# Fail loudly if the plug-in did not land where Lightroom loads it from, so the
+# installer never reports success for an install that does nothing.
+set -u
+
+TARGET="${HOME:-}/Library/Application Support/Adobe/Lightroom/Modules/papat.lrplugin"
+
+if [ ! -f "$TARGET/Info.lua" ]; then
+  echo "papat installer: Info.lua was not found in $TARGET" >&2
+  exit 1
+fi
+
+exit 0

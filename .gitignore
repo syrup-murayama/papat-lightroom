@@ -1,0 +1,28 @@
+.DS_Store
+dist/
+*.log
+
+# build output and local artefacts
+*.pkg
+*.zip
+*.dmg
+*.sha256
+notary-logs/
+
+# never commit credentials or signing material
+.env
+.env.*
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.pem
+*.key
+
+# editors / tools
+*.swp
+*~
+.idea/
+.vscode/
+.claude/
