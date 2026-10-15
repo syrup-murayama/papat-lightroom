@@ -163,7 +163,9 @@ local function run(context)
     props.expireText = expireText
     props.guidance = text.announcement {
       title = entry.title, url = entry.url or '', passcode = entry.passcode or '', expireText = expireText,
+      template = config.prefs().announcementTemplate,
     }
+    props.title = entry.title or ''
     props.copyStatus = ''
     props.statusText = statusLine(entry)
     props.note = ''
@@ -183,6 +185,7 @@ local function run(context)
     title = 'papat 最近のギャラリー',
     contents = contents,
     actionVerb = '閉じる',
+    actionBinding = { enabled = { bind_to_object = props, key = 'canClose' } },
     cancelVerb = '< exclude >',
     otherVerb = anyPending and '続きから送る' or nil,
   }

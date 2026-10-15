@@ -9,6 +9,10 @@ dist/
 *.sha256
 notary-logs/
 
+# the similarity helper is built by scripts/build-pkg.sh into a temp payload, never checked
+# in here; this only guards against a stray copy (e.g. an interrupted test run) being committed
+papat.lrplugin/bin/
+
 # never commit credentials or signing material
 .env
 .env.*

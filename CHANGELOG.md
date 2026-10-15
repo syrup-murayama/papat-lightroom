@@ -1,5 +1,90 @@
 # Changelog
 
+## 1.2.0
+
+- 使用許諾：第2版（2026-10-15 に承認）。「3. プラグインが送るもの」の末尾に、
+  「似た写真をまとめるための区切り（グループの番号）も送ります。まとめる計算は、この Mac の中で行います。写真は、そのために
+  どこにも送りません。同梱の小さな実行ファイルは通信せず、ソースを MIT で公開しています。」（英語も同じ内容）を追記。
+  版と履歴は `docs/license-history.md`
+- **Group boundaries from capture time** (`lib/grouping.lua`): a line-for-line Lua port of the gallery's own
+  `autoGroups` (the usual-gap-times-4 rule), cross-checked against the real JS through node (`tests/grouping.lua`).
+  The plug-in sends nothing new because of
+  this on its own; it is the shared building block for the two features below (both need the same group boundaries
+  the browser itself will show, before anything is sent)
+- **Similar photos grouped on the photographer's Mac** (`lib/similarity.lua`, a small bundled helper:
+  `papat.lrplugin/bin/papat-fprint`, built from `tools/papat-fprint/main.swift`). macOS only: Apple Vision's
+  `VNGenerateImageFeaturePrintRequest` refines the time groups above, splitting further where the picture changes
+  sharply within one of them (minimum 2 photos, a window of 3; tuned on one real shoot). The helper has no networking
+  code at all (only Foundation and Vision are imported) and writes nothing but 1-based group numbers; the plug-in
+  never stores or sends a feature print. Computed in its own task, next to the send, from small previews made just
+  for this (never the ones being uploaded), so it never adds to a send's own wait; not macOS, no helper, too few
+  usable previews, a failure or an unreadable answer just leaves the gallery on time groups alone — nothing is ever
+  shown about it. `scripts/build-pkg.sh` builds and bundles a universal (arm64 + x86_64) binary, signed when the
+  commissioning party has set `PAPAT_APP_IDENTITY` (a Developer ID Application certificate, distinct from the
+  installer's own `PAPAT_INSTALLER_IDENTITY`). The 使用許諾 screen now discloses this (第2版, below); the root
+  `LICENSE` (MIT, covering the source) is unchanged — only the installer's licence screen gained a sentence
+- **A selection over 888 photos is split into several galleries** (`lib/split.lua`; 2026-10-15 の決定). The
+  cut is chosen from the group boundaries above — closest to 888, first within 750-888 photos, then within
+  888-max_photos — falling back to the single largest capture-time gap in that range, then to a fixed 888th photo,
+  when there is no boundary or no grouping at all to go on. A last piece under 100 photos folds back into the one
+  before it rather than making a small gallery on its own. The settings dialog shows one line before creating
+  ("888 枚を 2 つのギャラリーに分けて送ります（750枚・138枚）") and prices each gallery on its own (300 photos per
+  unit) before adding them up. Titles get a "（1/2）" / "（2/2）" suffix; the invitation's `{URL}` becomes one
+  "N/M：url" line per gallery (a single gallery is unchanged). The galleries are created up front (so the one result
+  window can show every URL at once) and sent one after another in the background (`lib/sender.lua`'s new
+  `M.startMany`; a single send is now its n=1 case) — a failure in one does not stop the rest. `lib/update.lua`'s
+  own assumption for the server's `max_photos` (used until the status call says otherwise) is now 1000, matching
+  what the server is expected to use too (B52)
+- "写真が多すぎます" no longer refuses a large selection outright: it refuses only the (expected to be rare) case
+  where even the auto-split could not keep a gallery at or under `max_photos`
+
+## 1.1.0
+
+- 使用許諾：第1版（変更なし）
+- **Default: send from Lightroom's preview** ("速く送る", formerly "速さ優先"). The create dialog has a check box
+  "この回だけ、書き出して送る" to export once; the Plug-in Manager switch turns the preview off for good. A value stored by
+  1.0.x is dropped once so that everybody starts from the new default (`config.migrate`). The result still says
+  "プレビューから N 枚・書き出しで M 枚"; the probe of three photos and the per-photo fall-backs are unchanged. README, the
+  settings text and the dialogs say plainly that a preview can be older than the last edit (the plug-in cannot tell)
+- **Small versions for the gallery's overview** (`lib/thumb.lua`, a side channel in `lib/pipeline.lua`), never on the
+  photos' way. The bytes that were sent (preview or export, already cleaned) are shrunk by macOS `sips` in batches of 10
+  to 20 files by a separate task (short edge 400 px, long edge at most 800 px, JPEG 80; about 8.5 s in total for 296
+  photos on the test Mac), cleaned again and given the copyright / creator / contact segments and the sRGB profile.
+  Lightroom's small previews (`requestJpegThumbnail(400, 400)`) are deliberately NOT used: on a real machine, after an
+  edit the big preview level was new while the small one was still the old picture. They are PUT to
+  `thumbs/<same name>` by their own tasks after their photo (the server takes <= 256 KB and only after the photo, and
+  does not count them against 300 PUTs a minute); the manifest names them (`thumb`) in a later manifest, once they
+  have arrived (entries are sent again at the end, 100 at a time). Photos whose short edge is already <= 400 px get
+  none. A failure never fails a photo; three in a row stop it for the send. Photos and manifests are started at most
+  every 0.22 s; against a server that still counts the small versions, the first 429 is waited out (`Retry-After`) and
+  the small versions keep the interval for the rest of that send. The log breaks the time down (photo PUT, sips, small
+  version PUT, tail, manifest pass)
+- Late pass for the small versions: whether an entry already carried its `thumb` is noted before the manifest PUT
+  (a small version that arrives while the PUT waits is added by the pass), and the pass leaves `key_color` out, so the
+  server uses the gallery's current color (changed in the browser meanwhile) instead of the one the send started with
+- The create dialog no longer offers a client colour ("色（任意）", the recent colours, `#RRGGBB`): it is set in the
+  dashboard, and the create request carries none. (The stored recent colours, `text.normalizeKeyColor` and the
+  server's `key_color` handling are left in place; a gallery made by an earlier version keeps its colour.)
+- Announcement text: the SDK has no way to type a line break in an edit field (Return presses the dialog's default
+  button). The field is now a tall field in a scrolling window; in the result window and "最近のギャラリー" a
+  "編集中" check box disables the closing button so that Return is no longer swallowed; and "テキストエディタで開く" /
+  "編集した内容を反映" (here and in the Plug-in Manager) edit the text in the macOS text editor (`lib/editor.lua`,
+  `open -t` on a temporary .txt file)
+- Photo limit before creating: `max_photos` of the status call (cached with the update check) is used when the
+  server sends one, otherwise 900; the number in the "写真が多すぎます" sentence is the one in use
+- **Announcement template**: marks `{題} {URL} {パスコード} {期限}` (English names work too) in a template that is
+  edited in the Plug-in Manager (with a reset button) or from the result window ("この文面を、次回から使う" turns the
+  edited text back into a template). Lines whose marks are all empty are left out; a template without `{URL}` /
+  `{パスコード}` gets them appended; unusable templates are the default text, which is the old text
+- "この文面を、次回から使う": a short passcode (e.g. 2024) is turned back into `{パスコード}` only where it stands as the
+  passcode (the line that names it, as a whole token), the expiry date once, so the same digits in a title or a
+  sentence stay as written
+- Server messages: whatever the server wrote is shown as one line of at most 300 characters (line breaks removed,
+  cut with "…")
+- Server messages: `monthly_limit` shows the server's Japanese wording (a sentence without a number when there is
+  none); `active_gallery_limit` names its number only when the server sent it; "14 days" and "20 units" are no longer
+  written in the plug-in's own sentences
+
 ## 1.0.3
 
 - Fix: the metadata of exported JPEGs was not what the plug-in claimed (Exif, XMP develop settings and edit history,

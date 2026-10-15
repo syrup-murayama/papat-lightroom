@@ -39,6 +39,12 @@ eq(text.priceYen(300, 7), 88, 'price 300 photos 7d')
 eq(text.priceYen(301, 7), 176, 'price 301 photos 7d')
 eq(text.priceYen(300, 14), 176, 'price 300 photos 14d')
 eq(text.priceYen(900, 14), 352, 'price 900 photos 14d')
+eq(text.priceYenSplit({ 750, 138 }, 7), text.priceYen(750, 7) + text.priceYen(138, 7), 'priceYenSplit: sums each gallery')
+eq(text.priceLineYen(176, nil), '目安 176 円（税込）', 'priceLineYen: no free count')
+eq(text.priceLineYen(88, 0), '目安 88 円（税込）　※無料の残りはありません', 'priceLineYen: free exhausted')
+eq(text.priceLineYen(88, 3), '目安 88 円（税込）　※無料の残り 3 ギャラリー', 'priceLineYen: free remaining')
+eq(text.splitLine({ 750, 138 }), '888 枚を 2 つのギャラリーに分けて送ります（750枚・138枚）', 'splitLine: two galleries')
+eq(text.splitLine({ 888, 888, 224 }), '2000 枚を 3 つのギャラリーに分けて送ります（888枚・888枚・224枚）', 'splitLine: three galleries')
 
 -- text: dates ---------------------------------------------------------------
 eq(text.isoToEpoch('1970-01-02T00:00:00.000Z'), 86400, 'isoToEpoch day 2')
@@ -77,6 +83,20 @@ local ann = text.announcement({ title = '春の撮影', url = 'https://papat.app
 eq(ann, '写真をお送りします。\n春の撮影\n\nURL: https://papat.app/t/x/s/y/\nパスコード: ABC234\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement layout')
 eq(ann:find('登録', 1, true), nil, 'announcement: no "登録は要りません"')
 eq(text.announcement({ url = 'u', passcode = 'p' }), '写真をお送りします。\n\nURL: u\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement without title/expiry')
+
+-- announcement: 1.2.0's auto-split (several URLs, "N/M：URL" per line; opts.urls wins over opts.url)
+eq(text.announcement({ urls = { 'https://a/' }, passcode = 'p' }),
+  '写真をお送りします。\n\nURL: https://a/\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。',
+  'announcement: a single-entry urls behaves exactly like url')
+eq(text.announcement({ title = '春の撮影', urls = { 'https://a/', 'https://b/' }, passcode = 'ABC234', expireText = '10月17日まで' }),
+  '写真をお送りします。\n春の撮影\n\nURL: 1/2：https://a/\n2/2：https://b/\nパスコード: ABC234\n公開期限: 10月17日まで\n\n'
+    .. 'ブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。',
+  'announcement: two URLs, one per line, each numbered')
+eq(text.announcement({ urls = { 'https://a/', 'https://b/', 'https://c/' } }):find('1/3：https://a/', 1, true) ~= nil
+  and text.announcement({ urls = { 'https://a/', 'https://b/', 'https://c/' } }):find('3/3：https://c/', 1, true) ~= nil,
+  true, 'announcement: three URLs, all numbered out of 3')
+eq(text.announcement({ url = 'https://single/', urls = {}, passcode = 'p' }):find('https://single/', 1, true) ~= nil,
+  true, 'announcement: an empty urls table falls back to url')
 eq(text.jaMonthDay(10, 7), '10月7日', 'jaMonthDay')
 eq(text.compareVersions('1.0.0', '1.0.1'), -1, 'version lt')
 eq(text.compareVersions('1.10.0', '1.9.9'), 1, 'version gt')
@@ -482,6 +502,132 @@ plan = matching.collectionPlan(mm, '', '2026-10-10', false)
 eq(plan[1].name, 'papat 採用 2026-10-10', 'flat plan: no title')
 
 
+-- Announcement template (1.1.0) --------------------------------------------------
+do
+  local url, pass = 'https://papat.app/t/x/s/y/', 'ABC234'
+  local function ann(template, extra)
+    local o = { title = '春の撮影', url = url, passcode = pass, expireText = '10月17日まで', template = template }
+    for k, v in pairs(extra or {}) do o[k] = v end
+    return text.announcement(o)
+  end
+  -- the default template gives the old text, byte for byte
+  eq(ann(nil), '写真をお送りします。\n春の撮影\n\nURL: ' .. url .. '\nパスコード: ' .. pass
+    .. '\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: default = the old text')
+  eq(ann(nil, { title = '', expireText = '' }), '写真をお送りします。\n\nURL: ' .. url .. '\nパスコード: ' .. pass
+    .. '\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: lines with empty marks are left out')
+  -- own wording
+  eq(ann('{題} の写真です。\n{URL}\nパスコードは {パスコード} です（{期限}）。'),
+    '春の撮影 の写真です。\n' .. url .. '\nパスコードは ABC234 です（10月17日まで）。', 'template: own wording')
+  eq(ann('{title}: {url} / {passcode} / {expire}'), '春の撮影: ' .. url .. ' / ABC234 / 10月17日まで', 'template: English mark names')
+  -- missing URL / passcode are added at the end; unknown and broken marks stay
+  eq(ann('こんにちは。'), 'こんにちは。\n\nURL: ' .. url .. '\nパスコード: ' .. pass, 'template: missing URL and passcode are added')
+  eq(ann('{URL} だけ'), url .. ' だけ\nパスコード: ' .. pass, 'template: missing passcode is added')
+  eq(ann('{URL} {unknown} {パスコード {題'), url .. ' {unknown} {パスコード {題\nパスコード: ' .. pass,
+    'template: unknown / broken marks stay as written (and the passcode is added)')
+  -- unusable templates are the default
+  eq(ann(''), ann(nil), 'template: empty = default')
+  eq(ann('   \n  '), ann(nil), 'template: blank = default')
+  eq(ann(42), ann(nil), 'template: not a string = default')
+  eq(ann(string.rep('あ', 2001)), ann(nil), 'template: too long = default')
+  eq(ann('{題}\r\n{URL}\r{パスコード}'), '春の撮影\n' .. url .. '\n' .. pass, 'template: Windows / old Mac line ends')
+  eq(text.announcement({ url = 'u', passcode = 'p' }),
+    '写真をお送りします。\n\nURL: u\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: no opts beyond url/passcode')
+
+  -- an edited announcement becomes a template again
+  local edited = '春の撮影です。\n春の撮影\n' .. url .. '\nパスコード ABC234\n10月17日まで開けます。'
+  local template = text.templateFromAnnouncement(edited, { title = '春の撮影', url = url, passcode = pass, expireText = '10月17日まで' })
+  eq(template, '春の撮影です。\n{題}\n{URL}\nパスコード {パスコード}\n{期限}開けます。',
+    'fromAnnouncement: values become marks; the title only on a line of its own')
+  eq(ann(template, { title = 'また別の撮影' }), '春の撮影です。\nまた別の撮影\n' .. url .. '\nパスコード ABC234\n10月17日まで開けます。',
+    'fromAnnouncement: and renders again')
+  eq(text.templateFromAnnouncement('', { url = url }), text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: empty = default')
+  eq(text.templateFromAnnouncement(nil, {}), text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: nil = default')
+  -- a title that is a common word does not break sentences
+  eq(text.templateFromAnnouncement('写真をお送りします。\n写真\n' .. url, { title = '写真', url = url, passcode = pass, expireText = '' }),
+    '写真をお送りします。\n{題}\n{URL}', 'fromAnnouncement: a short title is only replaced as a whole line')
+end
+
+-- Audit 15 (必須②): a split send's 2nd+ URL must never survive into a saved template -------
+do
+  local url1, url2, url3 = 'https://papat.app/t/a/s/1/', 'https://papat.app/t/b/s/2/', 'https://papat.app/t/c/s/3/'
+
+  -- two galleries: round-trips back to one {URL} mark, neither URL survives
+  local ann2 = text.announcement({ title = '春の撮影', urls = { url1, url2 }, passcode = 'ABC234', expireText = '10月17日まで' })
+  local tpl2 = text.templateFromAnnouncement(ann2, {
+    title = '春の撮影', urls = { url1, url2 }, passcode = 'ABC234', expireText = '10月17日まで',
+  })
+  eq(tpl2, text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: two URLs fold back to exactly the default template')
+  eq(tpl2:find(url1, 1, true), nil, 'fromAnnouncement: the 1st URL does not survive')
+  eq(tpl2:find(url2, 1, true), nil, 'fromAnnouncement: the 2nd URL does not survive (this was the bug)')
+  eq(tpl2:find('{URL}', 1, true) ~= nil, true, 'fromAnnouncement: exactly one {URL} mark is left')
+  eq(select(2, tpl2:gsub('{URL}', '')), 1, 'fromAnnouncement: {URL} appears exactly once, not once per gallery')
+
+  -- three galleries: same, and it still renders correctly afterwards (round-trip)
+  local ann3 = text.announcement({ title = '夏の撮影', urls = { url1, url2, url3 }, passcode = 'XYZ999', expireText = '11月1日まで' })
+  local tpl3 = text.templateFromAnnouncement(ann3, {
+    title = '夏の撮影', urls = { url1, url2, url3 }, passcode = 'XYZ999', expireText = '11月1日まで',
+  })
+  eq(tpl3, text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: three URLs also fold back to the default template')
+  local rendered3 = text.announcement({ title = '次の撮影', url = 'https://papat.app/t/z/s/9/', passcode = 'NEXT01', expireText = '12月1日まで', template = tpl3 })
+  eq(rendered3:find(url1, 1, true), nil, 'fromAnnouncement: the saved template renders the NEXT client\'s own URL, not the old ones')
+  eq(rendered3:find('https://papat.app/t/z/s/9/', 1, true) ~= nil, true, 'fromAnnouncement: … and does carry the new URL')
+
+  -- a single gallery (urls with one entry) behaves exactly like the plain url= case (regression)
+  local ann1 = text.announcement({ title = '春の撮影', urls = { url1 }, passcode = 'ABC234', expireText = '10月17日まで' })
+  local annPlain = text.announcement({ title = '春の撮影', url = url1, passcode = 'ABC234', expireText = '10月17日まで' })
+  eq(ann1, annPlain, 'announcement: a one-entry urls table renders identically to url=')
+  local tpl1 = text.templateFromAnnouncement(ann1, { title = '春の撮影', urls = { url1 }, passcode = 'ABC234', expireText = '10月17日まで' })
+  eq(tpl1, text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: a single gallery still folds back to the default template')
+  eq(tpl1:find(url1, 1, true), nil, 'fromAnnouncement: single gallery — its own URL does not survive either')
+
+  -- an empty urls table is the same as not passing one (falls back to url=)
+  eq(text.templateFromAnnouncement(url1, { url = url1, urls = {} }), '{URL}',
+    'fromAnnouncement: empty urls table falls back to url=')
+
+  -- 後でよい (audit 15): a hand-edited 2nd+ line no longer matches the exact "N/M：url" shape
+  -- the line-by-line fold looks for — the URL must still not survive into the saved template
+  local handEdited = '写真をお送りします。\n春の撮影\n\nURL: 1/2：' .. url1 .. '\n2本目: ' .. url2 .. '（こちらもご覧ください）\n'
+    .. 'パスコード: ABC234\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。'
+  local tplHand = text.templateFromAnnouncement(handEdited, {
+    title = '春の撮影', urls = { url1, url2 }, passcode = 'ABC234', expireText = '10月17日まで',
+  })
+  eq(tplHand:find(url1, 1, true), nil, 'fromAnnouncement: hand-edited 2nd line — the 1st URL still does not survive')
+  eq(tplHand:find(url2, 1, true), nil, 'fromAnnouncement: hand-edited 2nd line — the 2nd URL does not survive either')
+end
+
+-- Audit 11 (low): short passcodes, text from the server -------------------------------
+do
+  local url = 'https://papat.app/t/x/s/y/'
+  -- a short numeric passcode that also appears in sentences is only replaced where it is the passcode
+  local edited = '2024年の春の撮影です。\n2024年 春\n' .. url .. '\nパスコード: 2024\n開けるのは 10月17日まで（10月17日までです）'
+  eq(text.templateFromAnnouncement(edited, { title = '2024年 春', url = url, passcode = '2024', expireText = '10月17日まで' }),
+    '2024年の春の撮影です。\n{題}\n{URL}\nパスコード: {パスコード}\n開けるのは {期限}（10月17日までです）',
+    'fromAnnouncement: a short passcode is replaced on the passcode line only; the date once')
+  -- without a line that names it: the first whole token, not a digit inside a longer number
+  eq(text.templateFromAnnouncement('番号 12024 と 2024 です', { url = url, passcode = '2024' }),
+    '番号 12024 と {パスコード} です', 'fromAnnouncement: not inside a longer run of digits')
+  -- the URL is replaced everywhere
+  eq(text.templateFromAnnouncement(url .. ' / ' .. url, { url = url, passcode = 'ZZ' }), '{URL} / {URL}', 'fromAnnouncement: the URL everywhere')
+
+  -- the server's wording: one line, at most 300 characters
+  eq(text.oneLine('a\r\nb\n\nc'), 'a b c', 'oneLine: line breaks become one space')
+  eq(text.oneLine('  あ\t\tい  '), 'あ い', 'oneLine: control characters, runs of spaces, trim')
+  eq(text.oneLine(string.rep('あ', 300)), string.rep('あ', 300), 'oneLine: 300 characters stay')
+  eq(text.oneLine(string.rep('あ', 301)), string.rep('あ', 300) .. '…', 'oneLine: cut at 300 characters, marked')
+  eq(text.oneLine(nil), '', 'oneLine: nil')
+  eq(text.oneLine(42), '', 'oneLine: not a string')
+end
+
+-- The photo limit: the server's number when it sends one ------------------------------
+eq(text.parseMaxPhotos(900), 900, 'maxPhotos: number')
+eq(text.parseMaxPhotos('1200'), 1200, 'maxPhotos: numeric string')
+eq(text.parseMaxPhotos(299.9), 299, 'maxPhotos: whole photos')
+eq(text.parseMaxPhotos(0), nil, 'maxPhotos: zero is no limit to trust')
+eq(text.parseMaxPhotos(-5), nil, 'maxPhotos: negative')
+eq(text.parseMaxPhotos(1e9), nil, 'maxPhotos: absurd')
+eq(text.parseMaxPhotos('lots'), nil, 'maxPhotos: not a number')
+eq(text.parseMaxPhotos(nil), nil, 'maxPhotos: missing')
+
 -- Free galleries come from the server, never from the plug-in ---------------
 eq(text.parseFreeRemaining(5), 5, 'free: number')
 eq(text.parseFreeRemaining('8'), 8, 'free: numeric string')
@@ -518,8 +664,275 @@ do
   end
   eq(worst <= 2, true, 'createIntro: at most 2 lines at 520 px (worst ' .. worst .. ')')
   eq(text.createIntro(9, { longEdge = 2048, embedRights = true }),
-    '選択中の 9 枚を、長辺 2048 px の JPEG にして送ります（RAW 原本は送りません）。画像には、著作権・作成者・連絡先だけが入ります。',
-    'createIntro: default text')
+    '選択中の 9 枚を、長辺 2048 px の JPEG に書き出して送ります（RAW 原本は送りません）。画像には、著作権・作成者・連絡先だけが入ります。',
+    'createIntro: export text')
+  eq(text.createIntro(9, { longEdge = 2048, embedRights = true, fast = true }),
+    '選択中の 9 枚を Lightroom のプレビュー（長辺 2048 px 前後）から送ります。RAW 原本は送りません。画像には、著作権・作成者・連絡先だけが入ります。',
+    'createIntro: preview text')
+end
+
+-- grouping: a line-for-line port of papat's own gallery page's autoGroups.
+-- tests/grouping.lua cross-checks it against the real JS through node; these are curated
+-- worked examples, checked without node.
+do
+  local grouping = load('grouping')
+
+  eq(grouping.BURST_SEC, 3, 'grouping: BURST_SEC pinned')
+  eq(grouping.MIN_SEC, 20, 'grouping: MIN_SEC pinned')
+  eq(grouping.MAX_SEC, 600, 'grouping: MAX_SEC pinned')
+  eq(grouping.DEFAULT_SEC, 90, 'grouping: DEFAULT_SEC pinned')
+  eq(grouping.RATIO, 4, 'grouping: RATIO pinned')
+  eq(grouping.WINDOW, 25, 'grouping: WINDOW pinned')
+  eq(grouping.MIN_SAMPLES, 8, 'grouping: MIN_SAMPLES pinned')
+  eq(grouping.MIN_AVG, 2, 'grouping: MIN_AVG pinned')
+
+  eq(grouping.wallSeconds('2026-10-01T09:00:00'), grouping.wallSeconds('2026-10-01 09:00:00'),
+    'grouping: wallSeconds T and space are the same')
+  eq(grouping.wallSeconds('2026-10-01'), nil, 'grouping: wallSeconds date only is nil')
+  eq(grouping.wallSeconds(''), nil, 'grouping: wallSeconds empty is nil')
+  eq(grouping.wallSeconds(nil), nil, 'grouping: wallSeconds nil is nil')
+  eq(grouping.wallSeconds('abc'), nil, 'grouping: wallSeconds garbage is nil')
+  eq(grouping.wallSeconds('2026-13-45T99:99:99'), nil, 'grouping: wallSeconds out of range is nil')
+  -- day-across-month-end rolls over the same way Date.UTC does (both sides are pure day counts)
+  eq(grouping.wallSeconds('2026-03-01T00:00:00') - grouping.wallSeconds('2026-02-28T00:00:00'),
+    86400, 'grouping: wallSeconds day arithmetic (non-leap Feb)')
+
+  -- a sequence of ISO datetimes `startEpoch + gapsSec[1], + gapsSec[2], ...` (first = startEpoch)
+  local function series(startEpoch, gapsSec)
+    local t, out = startEpoch, {}
+    out[1] = os.date('!%Y-%m-%dT%H:%M:%S', t)
+    for i, gap in ipairs(gapsSec) do
+      t = t + gap
+      out[i + 1] = os.date('!%Y-%m-%dT%H:%M:%S', t)
+    end
+    return out
+  end
+  local function repGaps(gap, n) -- n gaps, all equal to `gap` (n+1 photos)
+    local g = {}
+    for i = 1, n do g[i] = gap end
+    return g
+  end
+  local function sizes(groups, count)
+    local n = {}
+    for i = 1, count do n[i] = 0 end
+    for _, g in ipairs(groups) do if g > 0 then n[g] = n[g] + 1 end end
+    return n
+  end
+  local BASE = grouping.wallSeconds('2026-10-01T00:00:00')
+
+  -- all burst: never cut on gaps this short
+  do
+    local gaps = {}
+    for i = 1, 29 do gaps[i] = (i % 2 == 0) and 1 or 2 end
+    local r = grouping.autoGroups(series(BASE, gaps))
+    eq(r.count, 1, 'grouping: 30 photos, all 0-2s gaps -> one group')
+  end
+
+  -- item-internal gaps (8s) x3 items of 12 photos, items 120s apart -> 3 groups of 12
+  do
+    local gaps = {}
+    for item = 1, 3 do
+      for i = 1, 11 do gaps[#gaps + 1] = 8 end
+      if item < 3 then gaps[#gaps + 1] = 120 end
+    end
+    local r = grouping.autoGroups(series(BASE, gaps))
+    eq(r.count, 3, 'grouping: 3 items of 12, 8s/120s -> 3 groups')
+    local s = sizes(r.groups, r.count)
+    eq(s[1] == 12 and s[2] == 12 and s[3] == 12, true, 'grouping: 3 items of 12, sizes 12/12/12')
+  end
+
+  -- slower rhythm (45s/6min): fixed 60s would cut every photo; the ratio does not
+  do
+    local gaps = {}
+    for item = 1, 3 do
+      for i = 1, 9 do gaps[#gaps + 1] = 45 end
+      if item < 3 then gaps[#gaps + 1] = 360 end
+    end
+    local r = grouping.autoGroups(series(BASE, gaps))
+    eq(r.count, 3, 'grouping: 3 items of 10, 45s/6min -> 3 groups (not one per photo)')
+  end
+
+  -- a break (>10 min) always cuts, unless it would leave too-small groups
+  do
+    local r = grouping.autoGroups(series(BASE, { 5, 1200, 5 })) -- 2+2 photos, 20 min apart
+    eq(r.count, 2, 'grouping: 2+2 across a 20-minute break -> 2 groups')
+    local r2 = grouping.autoGroups(series(BASE, { 1200 })) -- 1+1, only 2 photos total
+    eq(r2.count, 1, 'grouping: 2 photos 20 minutes apart -> average below 2, not split')
+  end
+
+  -- a sparse, real-world-shaped example
+  do
+    local r = grouping.autoGroups(series(BASE, { 1, 3, 1, 2, 5, 115, 10, 2 })) -- gaps of [0,1,4,5,7,12,127,137,139]
+    eq(r.count, 2, 'grouping: sparse series -> 2 groups (6+3)')
+    local s = sizes(r.groups, r.count)
+    eq(s[1] == 6 and s[2] == 3, true, 'grouping: sparse series sizes 6+3')
+  end
+  eq(grouping.autoGroups(series(BASE, { 49, 467, 252, 243 })).count, 1,
+    'grouping: 5 photos minutes apart -> one group (too few samples, default 90s, no break)')
+  eq(grouping.autoGroups(series(BASE, { 10, 2, 16, 4, 1 })).count, 1,
+    'grouping: 6 photos within a minute -> one group')
+
+  -- edges
+  eq(grouping.autoGroups({}).count, 0, 'grouping: 0 photos -> count 0')
+  eq(grouping.autoGroups({ '' }).count, 0, 'grouping: 1 undated photo -> count 0')
+  eq(grouping.autoGroups({ series(BASE, {})[1] }).count, 1, 'grouping: 1 dated photo -> count 1')
+  eq(grouping.autoGroups(series(BASE, repGaps(0, 50))).count, 1, 'grouping: same second repeated -> one group')
+  eq(grouping.autoGroups(series(BASE, repGaps(30, 99))).count, 1, 'grouping: 100 photos every 30s -> one group')
+  eq(grouping.autoGroups(series(BASE, repGaps(900, 19))).count, 1,
+    'grouping: 20 photos every 15 minutes -> one group (would be 1-each, undone by MIN_AVG)')
+  eq(grouping.autoGroups(series(BASE, repGaps(1, 199))).count, 1, 'grouping: 200 photos all bursts -> one group')
+  -- day rollover: a 15s gap across midnight is just a 15s gap
+  eq(grouping.autoGroups({ '2026-10-01T23:59:50', '2026-10-02T00:00:05' }).count, 1,
+    'grouping: midnight rollover is not special')
+
+  -- manifest order does not matter: the function sorts by time itself
+  do
+    local dates = series(BASE, { 5, 400, 5 })
+    local reversed = { dates[4], dates[3], dates[2], dates[1] }
+    local r1 = grouping.autoGroups(dates)
+    local r2 = grouping.autoGroups(reversed)
+    eq(r1.groups[1] == r1.groups[2] and r1.groups[3] == r1.groups[4] and r1.groups[1] ~= r1.groups[3],
+      true, 'grouping: order sanity (forward)')
+    eq(r2.groups[4] == r2.groups[3] and r2.groups[2] == r2.groups[1] and r2.groups[4] ~= r2.groups[2],
+      true, 'grouping: reversed input gives the same grouping, mapped back to its own order')
+  end
+
+  -- undated photos mixed in: they are 0, never counted, and never affect the dated ones
+  do
+    local dates = series(BASE, { 5, 400, 5 })
+    local withGaps = { dates[1], '', dates[2], dates[3], 'not a date', dates[4] }
+    local r = grouping.autoGroups(withGaps)
+    eq(r.groups[2], 0, 'grouping: undated photo stays 0')
+    eq(r.groups[5], 0, 'grouping: unparsable datetime stays 0')
+    eq(r.count, 2, 'grouping: undated photos mixed in do not change the dated count')
+  end
+end
+
+-- split: where to cut a gallery larger than 888 photos (2026-10-15 の決定). Pure; no LrC.
+do
+  local split = load('split')
+  local grouping = load('grouping')
+
+  eq(split.TRIGGER, 888, 'split: TRIGGER pinned')
+  eq(split.LOWER, 750, 'split: LOWER pinned')
+  eq(split.TARGET, 888, 'split: TARGET pinned')
+  eq(split.MIN_LAST, 100, 'split: MIN_LAST pinned')
+
+  -- no split below/at the trigger
+  local function eqArr(actual, expected, label)
+    local ok = #actual == #expected
+    if ok then for i = 1, #expected do if actual[i] ~= expected[i] then ok = false end end end
+    eq(ok, true, label .. ' (got [' .. table.concat(actual, ',') .. '])')
+  end
+  eqArr(split.plan(1, nil, { '' }, 1000), { 1 }, 'split: 1 photo never splits')
+  eqArr(split.plan(888, nil, {}, 1000), { 888 }, 'split: exactly 888 does not split')
+
+  -- a group boundary inside [750,888]: used as is, closest to 888 wins among several
+  do
+    local n = 1000
+    local groups = {}
+    for i = 1, n do groups[i] = 1 end
+    for i = 801, n do groups[i] = 2 end -- boundary at 800 (dist 88)
+    for i = 851, n do groups[i] = 3 end -- boundary at 850 (dist 38): closer, should win
+    local dts = {}
+    for i = 1, n do dts[i] = '' end
+    eqArr(split.plan(n, groups, dts, 1000), { 850, 150 }, 'split: closest-of-several boundary in [750,888]')
+  end
+
+  -- no boundary in [750,888], one in [888,1000]: used, even though it leaves a small remainder
+  -- small enough to trigger the merge-back (remainder 50 < MIN_LAST, combined 1000 <= max)
+  do
+    local n = 1000
+    local groups = {}
+    for i = 1, n do groups[i] = (i <= 950) and 1 or 2 end -- boundary only at 950
+    local dts = {}
+    for i = 1, n do dts[i] = '' end
+    eqArr(split.plan(n, groups, dts, 1000), { 1000 }, 'split: a far boundary that leaves <100 merges back to one')
+  end
+
+  -- same, but the remainder is >= MIN_LAST: no merge
+  do
+    local n = 1000
+    local groups = {}
+    for i = 1, n do groups[i] = (i <= 900) and 1 or 2 end -- boundary at 900, remainder 100
+    local dts = {}
+    for i = 1, n do dts[i] = '' end
+    eqArr(split.plan(n, groups, dts, 1000), { 900, 100 }, 'split: a remainder of exactly MIN_LAST is kept')
+  end
+
+  -- no grouping at all (nil): falls back to the largest capture-time gap in range
+  do
+    local n = 1000
+    local dts = {}
+    for i = 1, n do dts[i] = os.date('!%Y-%m-%dT%H:%M:%S', 1790000000 + i * 10) end
+    -- widen the gap right after position 820 well beyond its neighbours
+    local t820 = grouping.wallSeconds(dts[820])
+    dts[821] = os.date('!%Y-%m-%dT%H:%M:%S', t820 + 9000)
+    for i = 822, n do dts[i] = os.date('!%Y-%m-%dT%H:%M:%S', t820 + 9000 + (i - 821) * 10) end
+    eqArr(split.plan(n, nil, dts, 1000), { 820, 180 }, 'split: no groups -> largest capture-time gap in range')
+  end
+
+  -- no grouping and no capture time anywhere: a fixed cut at 888
+  do
+    local n = 1000
+    local dts = {}
+    for i = 1, n do dts[i] = '' end
+    eqArr(split.plan(n, nil, dts, 1000), { 888, 112 }, 'split: nothing to go on -> fixed cut at 888')
+  end
+
+  -- more than one cut needed (selection far larger than maxPhotos): repeats the same rule
+  do
+    local n = 2500
+    local groups = {}
+    for i = 1, n do groups[i] = 1 end
+    for i = 821, n do groups[i] = 2 end   -- boundary at 820 (inside [750,888] of segment 1)
+    for i = 821 + 830, n do groups[i] = 3 end -- a boundary 830 into segment 2 (inside its [750,888])
+    local dts = {}
+    for i = 1, n do dts[i] = '' end
+    eqArr(split.plan(n, groups, dts, 1000), { 820, 830, 850 }, 'split: a large selection splits more than once')
+  end
+
+  -- a merge that would exceed maxPhotos never happens
+  do
+    local segs = split.mergeSmallTail({ 900, 50 }, 940)
+    eqArr(segs, { 900, 50 }, 'split: mergeSmallTail refuses when the combined size is too big')
+    segs = split.mergeSmallTail({ 900, 50 }, 950)
+    eqArr(segs, { 950 }, 'split: mergeSmallTail merges when it fits exactly')
+    segs = split.mergeSmallTail({ 500 }, 1000)
+    eqArr(segs, { 500 }, 'split: mergeSmallTail leaves a single segment alone')
+  end
+
+  -- renumbering: each segment's display groups restart at 1, 0 (no capture time) stays 0
+  do
+    local groups = { 1, 1, 2, 2, 3, 0, 0, 5, 5 }
+    eqArr(split.renumberSegment(groups, 1, 5), { 1, 1, 2, 2, 3 }, 'split: renumberSegment, first segment')
+    eqArr(split.renumberSegment(groups, 6, 7), { 0, 0 }, 'split: renumberSegment, all undated')
+    eqArr(split.renumberSegment(groups, 5, 9), { 1, 0, 0, 2, 2 }, 'split: renumberSegment, undated in the middle')
+    eqArr(split.renumberSegment(nil, 1, 3), { 0, 0, 0 }, 'split: renumberSegment with no groups at all')
+  end
+
+  -- findCut directly: an exact-888 boundary needs no fallback
+  do
+    local n = 1000
+    local groups = {}
+    for i = 1, n do groups[i] = (i <= 888) and 1 or 2 end
+    eq(split.findCut(n, groups, {}, 1000), 888, 'split: findCut, boundary exactly at the target')
+
+    -- two boundaries in the same [750,888] range: the closer of the two wins
+    groups = {}
+    for i = 1, n do groups[i] = 1 end
+    for i = 861, n do groups[i] = 2 end -- boundary at 860 (dist 28)
+    for i = 871, n do groups[i] = 3 end -- boundary at 870 (dist 18): closer, should win
+    eq(split.findCut(n, groups, {}, 1000), 870, 'split: findCut, the closer of two in the same range wins')
+
+    -- [750,888] takes strict priority over [888,1000], even when [888,1000] has a closer one
+    groups = {}
+    for i = 1, n do groups[i] = 1 end
+    for i = 761, n do groups[i] = 2 end -- boundary at 760 (dist 128), only candidate in [750,888]
+    for i = 901, n do groups[i] = 3 end -- boundary at 900 (dist 12): closer overall, but out of range
+    eq(split.findCut(n, groups, {}, 1000), 760,
+      'split: findCut, [750,888] wins over a closer boundary that only falls in [888,1000]')
+  end
 end
 
 print(string.format('%d checks, %d failed', total, failed))

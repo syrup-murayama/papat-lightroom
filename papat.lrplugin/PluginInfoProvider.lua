@@ -21,6 +21,7 @@ local api = dofile(_PLUGIN.path .. '/lib/api.lua')
 local location = dofile(_PLUGIN.path .. '/lib/location.lua')
 local ui = dofile(_PLUGIN.path .. '/lib/ui.lua')
 local log = dofile(_PLUGIN.path .. '/lib/log.lua')
+local editor = dofile(_PLUGIN.path .. '/lib/editor.lua')
 
 local PluginInfoProvider = {}
 
@@ -41,8 +42,8 @@ local SEND_OPTIONS = {
     title = '撮影者の★（Lightroom のレーティング）をギャラリーに表示する' },
   { key = 'embedRights', default = true,
     title = '画像に、著作権情報・作成者・連絡先（Lightroom に登録したもの）を入れる' },
-  { key = 'fastMode', default = false,
-    title = '速さ優先（書き出しの代わりに Lightroom のプレビューから送る・実験的）' },
+  { key = 'fastMode', default = true,
+    title = '速く送る（書き出しの代わりに Lightroom のプレビューから送る）' },
 }
 
 local function refreshKeyStatus(props)
@@ -173,7 +174,36 @@ local function copyToStandardLocation(props)
 end
 
 local function buildSections(f, props)
+  config.migrate()
   bindPrefs(props)
+  -- the wording of the announcement (案内文): shown as stored, or the default one
+  do
+    local prefs = config.prefs()
+    local stored = prefs.announcementTemplate
+    props.announcementTemplate = (type(stored) == 'string' and stored ~= '') and stored or text.DEFAULT_ANNOUNCEMENT_TEMPLATE
+    props.templateStatus = ''
+    if not props._papatTemplateObserver then
+      props._papatTemplateObserver = true
+      props:addObserver('announcementTemplate', function()
+        local value = props.announcementTemplate
+        local usable = text.normalizeTemplate(value)
+        if type(value) ~= 'string' or text.trim(value) == '' then
+          prefs.announcementTemplate = nil
+          props.templateStatus = '空のときは、もとの文が使われます。'
+        elseif usable == text.DEFAULT_ANNOUNCEMENT_TEMPLATE and value ~= usable then
+          prefs.announcementTemplate = nil -- too long: the default is used
+          props.templateStatus = string.format('長すぎます（%d 文字まで）。もとの文が使われます。', text.ANNOUNCEMENT_TEMPLATE_MAX)
+        else
+          if usable == text.DEFAULT_ANNOUNCEMENT_TEMPLATE then
+            prefs.announcementTemplate = nil -- nothing to keep: the default is the default
+          else
+            prefs.announcementTemplate = usable
+          end
+          props.templateStatus = ""
+        end
+      end)
+    end
+  end
   refreshKeyStatus(props)
   props.apiKeyInput = props.apiKeyInput or ''
   props.connectionText = props.connectionText or ''
@@ -210,14 +240,14 @@ local function buildSections(f, props)
     .. '\n画像には、Lightroom に登録した著作権情報・作成者・連絡先が入ります。'
     .. '位置情報、カメラのシリアル番号、現像設定は入りません。'
     .. '撮影者の★は、ギャラリーに「撮影者」として表示されます（クライアントが付ける★とは別です）。'
-  local fastNote = '「速さ優先」は、書き出しを行わず、Lightroom が持っているプレビュー画像（長辺 2048px 前後）をそのまま送ります。'
-    .. 'ずっと速くなりますが、画質・シャープネス・明るさが書き出しと少し違うことがあります。'
-    .. '届く画像の大きさと画質は、カタログ設定の「標準プレビューサイズ」と「プレビュー画質」で変わります'
-    .. '（長辺 2560px を超えるときは、自動で通常の書き出しにします）。'
-    .. '現像を変えたあとは、プレビューが古いままのことがあります。'
-    .. 'ライブラリ → プレビュー →「標準サイズのプレビューを作成」をしてから送ると確実です。'
-    .. '色や明るさを見て判断するクライアントに送る案件では、通常の書き出しをおすすめします。'
-    .. 'プレビューが取得できない写真や、大きすぎるプレビューは、自動で通常の書き出しに切り替えます。'
+  local fastNote = '「速く送る」（初期設定）は、書き出しを行わず、Lightroom が持っているプレビュー画像（長辺 2048px 前後）を送ります。'
+    .. '書き出しよりずっと速いので、選んでもらうための画像に向いています。'
+    .. '画質・シャープネス・明るさが書き出しと少し違うことがあり、'
+    .. '現像を変えた直後は、プレビューに反映されていないことがあります。'
+    .. '気になるときは、ギャラリーを作る画面の「この回だけ、書き出して送る」をオンにするか、'
+    .. 'ライブラリ → プレビュー →「標準サイズのプレビューを作成」をしてから送ってください。'
+    .. '色や明るさを見て判断するクライアントに送る案件では、書き出しをおすすめします（この設定をオフにすると、いつも書き出します）。'
+    .. 'プレビューが取得できない写真や、大きすぎるプレビューは、自動で書き出しに切り替えます。'
     .. 'どちらの方法でも、位置情報・撮影情報・シリアル番号・現像設定は取り除き、'
     .. '著作権・作成者・連絡先（オンのとき）は画像に入れます。'
 
@@ -236,6 +266,76 @@ local function buildSections(f, props)
         text_color = GREY,
         width = 520,
         height_in_lines = text.linesFor(fastNote, 520, 10),
+      },
+    },
+  }
+
+  local templateIntro = '「papat でギャラリーを作る」のあとに出る「案内文」の、もとになる文です。'
+    .. '{題}・{URL}・{パスコード}・{期限} の所に、そのギャラリーの値が入ります（題や期限が無いときは、その行は省かれます）。'
+    .. '{URL} や {パスコード} を書き忘れても、足りない分は最後に付きます。'
+    .. 'ギャラリーを作ったあとの画面で文を書き換えて「この文面を、次回から使う」を押しても、ここに保存されます。'
+
+  local templateEditorHint = 'この欄で Return を押すと設定の画面が閉じてしまうときは、「テキストエディタで開く」で書き換えて、'
+    .. '保存してから「編集した内容を反映」を押してください。'
+
+  local templateSection = {
+    title = 'papat — 案内文（クライアントに送る文面）',
+    f:column {
+      spacing = f:control_spacing(),
+      f:static_text {
+        title = templateIntro,
+        width = 520,
+        height_in_lines = text.linesFor(templateIntro, 520, 3),
+      },
+      -- a window onto a taller field: long texts scroll
+      f:scrolled_view {
+        horizontal_scroller = false,
+        width = 520,
+        height = 150,
+        f:edit_field {
+          value = bind('announcementTemplate'),
+          width_in_chars = 52,
+          height_in_lines = 40,
+          immediate = true,
+        },
+      },
+      f:row {
+        f:push_button {
+          title = 'テキストエディタで開く',
+          action = function()
+            LrTasks.startAsyncTask(function()
+              local path = editor.open(props.announcementTemplate, 'announcement-template')
+              props.templateStatus = path and 'テキストエディタで開きました。保存してから「編集した内容を反映」を押してください。'
+                or 'テキストエディタを開けませんでした。'
+            end)
+          end,
+        },
+        f:push_button {
+          title = '編集した内容を反映',
+          action = function()
+            local data = editor.read('announcement-template')
+            if data and text.trim(data) ~= '' then
+              props.announcementTemplate = data
+              props.templateStatus = '編集した内容を反映しました。'
+            else
+              props.templateStatus = '編集した内容を読み込めませんでした（保存されているか確かめてください）。'
+            end
+          end,
+        },
+        f:push_button {
+          title = 'もとの文に戻す',
+          action = function()
+            props.announcementTemplate = text.DEFAULT_ANNOUNCEMENT_TEMPLATE
+            props.templateStatus = 'もとの文に戻しました。'
+          end,
+        },
+      },
+      f:static_text { title = bind('templateStatus'), text_color = GREY, width = 520, height_in_lines = 2 },
+      f:static_text {
+        title = templateEditorHint,
+        text_color = GREY,
+        width = 520,
+        height_in_lines = text.linesFor(templateEditorHint, 520, 2),
       },
     },
   }
@@ -391,8 +491,9 @@ local function buildSections(f, props)
     },
   }
 
-  -- order follows the work: connect, send (アタリ送付), receive (セレクト受け取り), about
+  -- order follows the work: connect, send (アタリ送付), the wording (案内文), receive (セレクト受け取り), about
   table.insert(sections, 2, sendSection)
+  table.insert(sections, 3, templateSection)
 
   -- Loaded from the standard Modules folder: no warning, no button, one line above.
   if props.locationWarn then

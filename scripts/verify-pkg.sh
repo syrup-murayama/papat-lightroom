@@ -41,8 +41,14 @@ OTHER="$(cd "$COMP/Payload" && find . -mindepth 1 -maxdepth 1 ! -name papat.lrpl
 [ -z "$OTHER" ] && ok 'payload contains only papat.lrplugin' || fail "unexpected payload entries: $OTHER"
 STRAY="$(find "$COMP/Payload" \( -name '.DS_Store' -o -name '._*' \))"
 [ -z "$STRAY" ] && ok 'no .DS_Store / AppleDouble files' || fail "stray files: $STRAY"
-NONLUA="$(find "$COMP/Payload/papat.lrplugin" -type f ! -name '*.lua' ! -name LICENSE)"
-[ -z "$NONLUA" ] && ok 'only .lua files and LICENSE' || fail "unexpected files: $NONLUA"
+NONLUA="$(find "$COMP/Payload/papat.lrplugin" -type f ! -name '*.lua' ! -name LICENSE ! -name papat-fprint)"
+[ -z "$NONLUA" ] && ok 'only .lua files, LICENSE and the papat-fprint helper' || fail "unexpected files: $NONLUA"
+if [ -f "$COMP/Payload/papat.lrplugin/bin/papat-fprint" ]; then
+  ok 'bin/papat-fprint is present'
+  [ -x "$COMP/Payload/papat.lrplugin/bin/papat-fprint" ] && ok 'bin/papat-fprint is executable' || fail 'bin/papat-fprint is not executable'
+else
+  fail 'bin/papat-fprint missing'
+fi
 
 echo "== scripts"
 for s in preinstall postinstall; do

@@ -14,7 +14,8 @@ local M = {}
 
 M.UNIT_YEN = 88
 M.PHOTOS_PER_UNIT = 300
-M.MAX_PHOTOS = 900
+M.MAX_PHOTOS = 1000 -- what is assumed until the server says otherwise (status: max_photos);
+                     -- 1.2.0's auto-split keeps a single gallery to this many (decided 2026-10-15)
 M.MIN_PASSCODE_LENGTH = 4
 M.MAX_PASSCODE_LENGTH = 64
 
@@ -36,13 +37,47 @@ function M.parseFreeRemaining(value)
   return math.floor(n)
 end
 
---- The estimate line of the create dialog. `free` is the server's remaining free galleries
---- (nil = unknown: the free allowance is then not mentioned at all).
-function M.priceLine(photoCount, days, free)
-  local line = string.format('目安 %d 円（税込）', M.priceYen(photoCount, days))
+--- The most photos one gallery may hold, as the server says (`max_photos` of the status call): a
+--- whole number from 1 to 100000, or nil (then M.MAX_PHOTOS is used).
+function M.parseMaxPhotos(value)
+  local n = tonumber(value)
+  if not n or n ~= n or n < 1 or n > 100000 then return nil end
+  return math.floor(n)
+end
+
+--- Same line, from an already-computed yen amount (1.2.0: a split send counts each gallery
+--- separately — 枚数 300 で 1 単位 — and shows the total). `free` is the server's remaining
+--- free galleries (nil = unknown: the free allowance is then not mentioned at all).
+function M.priceLineYen(yen, free)
+  local line = string.format('目安 %d 円（税込）', yen)
   if free == nil then return line end
   if free <= 0 then return line .. '　※無料の残りはありません' end
   return line .. string.format('　※無料の残り %d ギャラリー', free)
+end
+
+--- The estimate line of the create dialog. `free` is the server's remaining free galleries
+--- (nil = unknown: the free allowance is then not mentioned at all).
+function M.priceLine(photoCount, days, free)
+  return M.priceLineYen(M.priceYen(photoCount, days), free)
+end
+
+--- The total yen for several galleries (1.2.0's auto-split: each gallery is priced on its own
+--- photo count, then added up). `segments` is an array of photo counts.
+function M.priceYenSplit(segments, days)
+  local total = 0
+  for _, count in ipairs(segments) do total = total + M.priceYen(count, days) end
+  return total
+end
+
+--- "選んだ写真を2つのギャラリーに分けて送ります（750枚・138枚）" — the one line shown before
+--- creating a split send. Kept to one line, on purpose (言葉は少なく).
+function M.splitLine(segments)
+  local total, parts = 0, {}
+  for _, count in ipairs(segments) do
+    total = total + count
+    parts[#parts + 1] = string.format('%d枚', count)
+  end
+  return string.format('%d 枚を %d つのギャラリーに分けて送ります（%s）', total, #segments, table.concat(parts, '・'))
 end
 
 -- ---------------------------------------------------------------------------
@@ -149,6 +184,23 @@ function M.cleanTitle(s, maxChars)
     s = s:sub(1, cut)
   end
   return s
+end
+
+--- A text from outside (the server's message) as one line of at most `maxChars` characters:
+--- line breaks and control characters become spaces, runs of spaces one space, the end is cut on a
+--- character boundary and marked with "…". nil / non-strings give ''.
+function M.oneLine(value, maxChars)
+  if type(value) ~= 'string' then return '' end
+  maxChars = maxChars or 300
+  local flat = value:gsub('[%c]+', ' '):gsub('  +', ' ')
+  flat = M.trim(flat)
+  local out, count, cut = {}, 0, false
+  for ch in flat:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
+    if count >= maxChars then cut = true; break end
+    out[#out + 1] = ch
+    count = count + 1
+  end
+  return table.concat(out) .. (cut and '…' or '')
 end
 
 --- Percent-encode one URL path segment (UTF-8 bytes; RFC 3986 unreserved kept).
@@ -533,18 +585,201 @@ end
 
 --- Same shape as the invitation text of the web dashboard:
 ---   title / URL / passcode / expiry date / "open in the browser … press 確定".
-function M.announcement(opts)
-  local lines = { '写真をお送りします。' }
-  if opts.title and opts.title ~= '' then lines[#lines + 1] = opts.title end
-  lines[#lines + 1] = ''
-  lines[#lines + 1] = 'URL: ' .. opts.url
-  lines[#lines + 1] = 'パスコード: ' .. opts.passcode
-  if opts.expireText and opts.expireText ~= '' then
-    lines[#lines + 1] = '公開期限: ' .. opts.expireText
+--- The photographer can keep their own wording (a template with marks, see below); this is
+--- what is used until they do.
+M.DEFAULT_ANNOUNCEMENT_TEMPLATE = '写真をお送りします。\n{題}\n\nURL: {URL}\nパスコード: {パスコード}\n公開期限: {期限}\n\n'
+  .. 'ブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。'
+M.ANNOUNCEMENT_TEMPLATE_MAX = 2000
+
+-- the marks of a template ({題} {URL} {パスコード} {期限}; the English names work as well)
+local TEMPLATE_MARKS = {
+  ['題'] = 'title', ['title'] = 'title',
+  ['URL'] = 'url', ['url'] = 'url',
+  ['パスコード'] = 'passcode', ['passcode'] = 'passcode',
+  ['期限'] = 'expire', ['expire'] = 'expire',
+}
+M.TEMPLATE_MARK_TEXT = '{題}　{URL}　{パスコード}　{期限}'
+
+--- A template that can be used: a non-empty string of reasonable length, line ends normalised.
+--- Anything else (nil, blank, huge) is the default. Never raises.
+function M.normalizeTemplate(template)
+  if type(template) ~= 'string' then return M.DEFAULT_ANNOUNCEMENT_TEMPLATE end
+  template = template:gsub('\r\n', '\n'):gsub('\r', '\n')
+  if M.trim(template) == '' or #template > M.ANNOUNCEMENT_TEMPLATE_MAX then
+    return M.DEFAULT_ANNOUNCEMENT_TEMPLATE
   end
-  lines[#lines + 1] = ''
-  lines[#lines + 1] = 'ブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。'
+  return template
+end
+
+--- Fill a template. A line whose marks are all empty (no title, no expiry date) is left out, so the
+--- default reads exactly as before. A template that lacks {URL} or {パスコード} gets the missing
+--- value appended: the text is useless without them. Unknown or broken marks stay as they are.
+--- @param opts table { title, url, passcode, expireText, template }
+--- The {URL} mark's text: one URL as given, or (1.2.0's auto-split) several, one per line,
+--- each marked "N/M：" — opts.urls wins over opts.url when both are given.
+local function urlMarkText(opts)
+  if type(opts.urls) == 'table' and #opts.urls > 0 then
+    if #opts.urls == 1 then return opts.urls[1] end
+    local lines = {}
+    for i, url in ipairs(opts.urls) do lines[#lines + 1] = string.format('%d/%d：%s', i, #opts.urls, url) end
+    return table.concat(lines, '\n')
+  end
+  return opts.url or ''
+end
+
+function M.announcement(opts)
+  local template = M.normalizeTemplate(opts.template)
+  local values = {
+    title = opts.title or '', url = urlMarkText(opts), passcode = opts.passcode or '', expire = opts.expireText or '',
+  }
+  local used = {}
+  local lines = {}
+  for line in (template .. '\n'):gmatch('(.-)\n') do
+    local marks, filled = 0, 0
+    local out = line:gsub('{([^{}\n]+)}', function(name)
+      local key = TEMPLATE_MARKS[name] or TEMPLATE_MARKS[name:lower()]
+      if not key then return nil end
+      marks = marks + 1
+      used[key] = true
+      if values[key] ~= '' then filled = filled + 1 end
+      return values[key]
+    end)
+    if not (marks > 0 and filled == 0) then lines[#lines + 1] = out end
+  end
+  if not used.url and values.url ~= '' then
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = 'URL: ' .. values.url
+  end
+  if not used.passcode and values.passcode ~= '' then
+    lines[#lines + 1] = 'パスコード: ' .. values.passcode
+  end
   return table.concat(lines, '\n')
+end
+
+--- The other way round: the wording of an edited announcement as a template (what the photographer
+--- changed in the result window becomes "next time's" text). The actual URL, passcode and expiry
+--- date are put back as marks. Only where they stand as the value:
+---   - the title only when it is a whole line of its own (done first, so a title that contains the
+---     passcode, e.g. "2024年 春" with passcode 2024, is not touched twice);
+---   - the URL everywhere (long and specific); opts.urls (1.2.0's auto-split: more than one
+---     gallery) wins over opts.url and folds every one of its "N/M：url" lines back to one
+---     {URL} mark — a saved template must never carry a second (or third...) client's own
+---     gallery link forward to the next announcement;
+---   - the passcode and the expiry date once: the first occurrence as a whole token (not inside a
+---     longer run of letters / digits), preferring a line that says パスコード / passcode. A short
+---     numeric passcode in a sentence ("2024年の春") is therefore left alone.
+function M.templateFromAnnouncement(announcement, opts)
+  if type(announcement) ~= 'string' then return M.DEFAULT_ANNOUNCEMENT_TEMPLATE end
+  opts = opts or {}
+
+  local function replaceAll(source, plain, mark)
+    if type(plain) ~= 'string' or plain == '' then return source end
+    local out, from = {}, 1
+    while true do
+      local a, b = source:find(plain, from, true)
+      if not a then break end
+      out[#out + 1] = source:sub(from, a - 1)
+      out[#out + 1] = mark
+      from = b + 1
+    end
+    out[#out + 1] = source:sub(from)
+    return table.concat(out)
+  end
+
+  -- 1.2.0's auto-split: M.announcement wrote several URLs as one "N/M：url" line each (the
+  -- first keeping whatever else stood on its line, e.g. "URL: "; the rest are nothing but that
+  -- token). A single URL is unaffected (same as replaceAll). Must fold every one of them back
+  -- to one {URL} mark — leaving even one of them as a literal URL would carry one client's
+  -- gallery link into the template used for the next client's announcement (audit 15 §3.4).
+  local function replaceUrls(source, urls)
+    if type(urls) ~= 'table' or #urls == 0 then return source end
+    if #urls == 1 then return replaceAll(source, urls[1], '{URL}') end
+    local n = #urls
+    local lines = {}
+    for line in (source .. '\n'):gmatch('(.-)\n') do lines[#lines + 1] = line end
+    local out, i = {}, 1
+    while i <= #lines do
+      local line = lines[i]
+      local marker = string.format('1/%d：%s', n, urls[1])
+      local at = line:find(marker, 1, true)
+      if at then
+        out[#out + 1] = line:sub(1, at - 1) .. '{URL}' .. line:sub(at + #marker)
+        local skip = i
+        for k = 2, n do
+          if lines[skip + 1] == string.format('%d/%d：%s', k, n, urls[k]) then
+            skip = skip + 1
+          else
+            break -- not the exact shape M.announcement writes: leave the rest untouched
+          end
+        end
+        i = skip + 1
+      else
+        out[#out + 1] = line
+        i = i + 1
+      end
+    end
+    local result = table.concat(out, '\n')
+    -- the photographer may have edited around a "N/M：url" line (reworded it, dropped a line,
+    -- reordered them) so it no longer matches that exact shape and was left alone above: any
+    -- URL still literally present is cleared rather than risking it in the saved template.
+    for k = 1, n do result = replaceAll(result, urls[k], '') end
+    return result
+  end
+
+  -- all (start, stop) of `plain` in `line` that are whole tokens
+  local function tokenHits(line, plain)
+    local hits, from = {}, 1
+    while true do
+      local a, b = line:find(plain, from, true)
+      if not a then break end
+      local before = a > 1 and line:sub(a - 1, a - 1) or ''
+      local after = b < #line and line:sub(b + 1, b + 1) or ''
+      local firstChar, lastChar = plain:sub(1, 1), plain:sub(-1)
+      local glued = (before:match('^[%w_]$') and firstChar:match('^[%w_]$'))
+        or (after:match('^[%w_]$') and lastChar:match('^[%w_]$'))
+      if not glued then hits[#hits + 1] = { a, b } end
+      from = b + 1
+    end
+    return hits
+  end
+
+  -- the first whole-token occurrence in the whole text, on a line that names it if there is one
+  local function replaceOnce(source, plain, mark, hintPattern)
+    if type(plain) ~= 'string' or plain == '' then return source end
+    local lines = {}
+    for line in (source .. '\n'):gmatch('(.-)\n') do lines[#lines + 1] = line end
+    local function try(onlyHinted)
+      for index, line in ipairs(lines) do
+        if not onlyHinted or (hintPattern and line:lower():find(hintPattern)) then
+          local hits = tokenHits(line, plain)
+          if hits[1] then
+            lines[index] = line:sub(1, hits[1][1] - 1) .. mark .. line:sub(hits[1][2] + 1)
+            return true
+          end
+        end
+      end
+      return false
+    end
+    if not try(true) then try(false) end
+    return table.concat(lines, '\n')
+  end
+
+  local result = announcement:gsub('\r\n', '\n'):gsub('\r', '\n')
+  if type(opts.title) == 'string' and opts.title ~= '' then
+    local lines = {}
+    for line in (result .. '\n'):gmatch('(.-)\n') do
+      lines[#lines + 1] = (line == opts.title) and '{題}' or line
+    end
+    result = table.concat(lines, '\n')
+  end
+  if type(opts.urls) == 'table' and #opts.urls > 0 then
+    result = replaceUrls(result, opts.urls)
+  else
+    result = replaceAll(result, opts.url, '{URL}')
+  end
+  result = replaceOnce(result, opts.passcode, '{パスコード}', 'パスコード')
+  result = replaceOnce(result, opts.expireText, '{期限}', '期限')
+  return M.normalizeTemplate(result)
 end
 
 -- ---------------------------------------------------------------------------
@@ -588,16 +823,19 @@ function M.linesFor(s, widthPx, minLines)
   return math.max(minLines or 1, M.wrappedLines(s, widthPx))
 end
 
---- Intro of the "create gallery" dialog: the essentials only (what is sent, what the images carry).
---- The details are in the settings screen and in the confirmation shown once.
+--- Intro of the "create gallery" dialog: the essentials only (what is sent, where it comes from,
+--- what the images carry). The details are in the settings screen and in the confirmation shown once.
 --- @param o table { longEdge, fast = bool, embedRights = bool }
 function M.createIntro(count, o)
-  local size = string.format('長辺 %d px', o.longEdge)
-  if o.fast then size = size .. ' 前後（速さ優先）' end
   local carried = o.embedRights
     and '画像には、著作権・作成者・連絡先だけが入ります。'
     or '著作権・連絡先などは、画像に入れません。'
-  return string.format('選択中の %d 枚を、%s の JPEG にして送ります（RAW 原本は送りません）。%s', count, size, carried)
+  if o.fast then
+    return string.format('選択中の %d 枚を Lightroom のプレビュー（長辺 %d px 前後）から送ります。RAW 原本は送りません。%s',
+      count, o.longEdge, carried)
+  end
+  return string.format('選択中の %d 枚を、長辺 %d px の JPEG に書き出して送ります（RAW 原本は送りません）。%s',
+    count, o.longEdge, carried)
 end
 
 -- ---------------------------------------------------------------------------

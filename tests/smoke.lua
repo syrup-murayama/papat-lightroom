@@ -48,7 +48,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local tmpRoot = os.getenv('TMPDIR') or '/tmp'
-tmpRoot = tmpRoot:gsub('/+$', '') .. '/papat-smoke-' .. tostring(os.time())
+tmpRoot = tmpRoot:gsub('/+$', '') .. '/papat-smoke-' .. tostring(os.time()) .. '-' .. (os.tmpname():match('[^/]+$') or '0') -- two runs in one second must not share a folder
 os.execute('mkdir -p "' .. tmpRoot .. '"')
 
 local env = {
@@ -61,6 +61,82 @@ local env = {
   prefs = { locationPromptShown = true },
   server = {},        -- scripted responses: function(req) -> status, bodyTable, headers
 }
+
+-- macOS `sips -Z <long> -s format jpeg -s formatOptions 80 <in>... --out <dir>`: for every input writes
+-- <dir>/<same file name>, a (structurally valid) JPEG whose long edge is <long>. env.sipsMode:
+-- 'fail' (exit 1, nothing written), 'big' (over 256 KB), 'wide' (ignores -Z), 'garbage' (not a JPEG).
+function env.fakeSips(cmd, inPaths, outDir)
+  env.sipsCalls = (env.sipsCalls or 0) + 1
+  env.sipsFilesSeen = (env.sipsFilesSeen or 0) + #inPaths
+  local mode = env.sipsMode
+  if mode == 'fail' then return 1 end
+  local jpegLib = dofile(_PLUGIN.path .. '/lib/jpeg.lua')
+  local long = tonumber(cmd:match('%-Z (%d+)'))
+  for _, inPath in ipairs(inPaths) do
+    local fh = io.open(inPath, 'rb')
+    local info
+    if fh then
+      local data = fh:read('*a')
+      fh:close()
+      info = jpegLib.parse(data)
+    end
+    if info then
+      local w, h = info.width, info.height
+      if mode ~= 'wide' then
+        local scale = long / math.max(w, h)
+        w, h = math.max(1, math.floor(w * scale + 0.5)), math.max(1, math.floor(h * scale + 0.5))
+      end
+      local out = io.open(outDir .. '/' .. inPath:match('[^/]+$'), 'wb')
+      if out then
+        if mode == 'garbage' then
+          out:write('not a jpeg at all')
+        else
+          local body = jpegBytes('thumb', true, w, h, true) -- sips adds a little Exif: the plug-in removes it
+          if mode == 'big' then body = body:sub(1, -4) .. string.rep('X', 300 * 1024) .. body:sub(-3) end
+          out:write(body)
+        end
+        out:close()
+        env.sipsSizes = env.sipsSizes or {}
+        env.sipsSizes[#env.sipsSizes + 1] = { w, h }
+      end
+    end
+  end
+  return 0
+end
+
+-- The bundled similarity helper (papat.lrplugin/bin/papat-fprint; tools/papat-fprint/main.swift):
+-- reads { photos, timeGroups } from inPath, writes { groups } to outPath. env.fprintMode:
+--   'passthrough' (default)  groups = timeGroups, unchanged (nothing to refine, nothing lost)
+--   'refine'                 env.fprintGroups overrides the whole groups array
+--   'fail'                   exit 1, nothing written
+--   'garbage'                exit 0, but outPath is not valid JSON
+--   'wronglen'                exit 0, but groups has the wrong length
+function env.fakeFprint(inPath, outPath)
+  env.fprintCalls = (env.fprintCalls or 0) + 1
+  local mode = env.fprintMode or 'passthrough'
+  if mode == 'fail' then return 1 end
+  local inFh = io.open(inPath, 'rb')
+  local raw = inFh and inFh:read('*a') or ''
+  if inFh then inFh:close() end
+  local okDecode, input = pcall(json.decode, raw)
+  local n = (okDecode and type(input) == 'table' and type(input.photos) == 'table') and #input.photos or 0
+  local groups
+  if mode == 'garbage' then
+    local fh = io.open(outPath, 'wb'); fh:write('not json'); fh:close()
+    return 0
+  elseif mode == 'wronglen' then
+    groups = { 1 }
+  elseif mode == 'refine' then
+    groups = env.fprintGroups
+  else
+    groups = input.timeGroups
+  end
+  local fh = io.open(outPath, 'wb')
+  if not fh then return 1 end
+  fh:write(json.encode({ groups = groups }))
+  fh:close()
+  return 0
+end
 
 local function fakeFactory()
   return setmetatable({
@@ -80,14 +156,20 @@ modules.LrView = {
 }
 modules.LrColor = function(...) return { ... } end
 modules.LrBinding = {
+  -- like Lightroom's observable table: observers run when a value changes
   makePropertyTable = function()
-    local observers = {}
+    local observers, values = {}, {}
     return setmetatable({}, {
       __index = function(_, k)
         if k == 'addObserver' then
           return function(_, key, fn) observers[key] = fn end
         end
-        return nil
+        return values[k]
+      end,
+      __newindex = function(t, k, v)
+        local changed = values[k] ~= v
+        values[k] = v
+        if changed and observers[k] then observers[k](t, k, v) end
       end,
     })
   end,
@@ -143,12 +225,27 @@ modules.LrTasks = {
   end,
   sleep = function(seconds)
     env.sleeps[#env.sleeps + 1] = seconds or 0
+    env.clock = (env.clock or 0) + (seconds or 0) -- time passes while a task sleeps
     if coroutine.isyieldable() then coroutine.yield() end
   end,
   yield = function()
     if coroutine.isyieldable() then coroutine.yield() end
   end,
-  execute = function(cmd) env.commands[#env.commands + 1] = cmd; return 0 end,
+  execute = function(cmd)
+    env.commands[#env.commands + 1] = cmd
+    if cmd:find('^sips ') then
+      local paths = {}
+      for quoted in cmd:gmatch("'([^']+)'") do paths[#paths + 1] = quoted end
+      local outDir = table.remove(paths) -- the last quoted path is --out <dir>
+      return env.fakeSips(cmd, paths, outDir)
+    end
+    if cmd:find("papat%-fprint'") then
+      local quoted = {}
+      for q in cmd:gmatch("'([^']+)'") do quoted[#quoted + 1] = q end
+      return env.fakeFprint(quoted[2], quoted[3]) -- quoted[1] is the binary itself
+    end
+    return 0
+  end,
 }
 local function drain()
   local rounds = 0
@@ -184,6 +281,14 @@ do
 end
 modules.LrPrefs = { prefsForPlugin = function()
   local p = env.prefs
+  -- Since 1.1.0 sending from the preview is the default. The older tests are about the export
+  -- path: they run as if the 1.1.0 migration had happened and fastMode had been switched off.
+  -- The tests of the new default set env.rawPrefs.
+  if not env.rawPrefs and p.fastModeDefaultV110 == nil then
+    p.fastModeDefaultV110 = true
+    if p.fastMode == nil then p.fastMode = false end
+    if p.thumbs == nil then p.thumbs = false end -- the small versions have their own tests
+  end
   if not env.updateCheckLive and p.updateInfoJson == nil then
     p.updateInfoJson = json.encode({ forVersion = pluginVersion, fetchedAt = os.time(), latest = pluginVersion, minimum = '1.0.0' })
   end
@@ -209,6 +314,13 @@ modules.LrHttp = {
   end,
   post = function(url, body, headers, method)
     local req = { method = method or 'POST', url = url, headers = headers, body = body }
+    -- a manifest PUT that waits for the network (the other tasks run meanwhile)
+    if env.yieldOnManifest and url:find('manifest%.json$') then
+      for _ = 1, env.yieldOnManifest do modules.LrTasks.yield() end
+    end
+    if env.thumbPutYields and url:find('/files/thumbs/') then
+      for _ = 1, env.thumbPutYields do modules.LrTasks.yield() end
+    end
     env.requests[#env.requests + 1] = req
     local status, rbody, h = env.server(req)
     local out = h or {}
@@ -273,6 +385,21 @@ modules.LrFileUtils = {
 local function newPhoto(path, props)
   local photo = { path = path, props = props or {}, raw = { uuid = 'uuid-' .. path }, keywords = {}, writes = {} }
   function photo:requestJpegThumbnail(w, h, cb)
+    if w and w <= 600 then
+      -- the small preview (the plug-in asks for 400): the smallest level that is 400 px or more
+      env.smallRequests = (env.smallRequests or 0) + 1
+      env.clock = (env.clock or 0) + (env.smallSeconds or 0)
+      if env.smallMode == 'none' or self.noSmall then
+        cb(nil, 'no small preview')
+      elseif env.smallMode == 'big' or self.smallBig then
+        cb(jpegBytes('small-' .. path, false, 1028 * 2, 1371 * 2 // 2, true), nil) -- longer than the server takes
+      elseif env.smallMode == 'exif' or self.smallExif then
+        cb(jpegBytes('camera-thumb-' .. path, true, 514, 343, true), nil)
+      else
+        cb(jpegBytes('small-' .. path, false, 514, 343, true), nil)
+      end
+      return {}
+    end
     env.thumbRequests = (env.thumbRequests or 0) + 1
     env.clock = (env.clock or 0) + (env.thumbSeconds or 0)
     if self.noThumb then
@@ -383,7 +510,8 @@ modules.LrExportSession = function(args)
         if photo.badJpeg then
           fh:write('\255\216\255 this is not a usable JPEG')
         else
-          fh:write(jpegBytes('fake-jpeg-' .. tostring(i), true))
+          local d = photo.exportDims or {}
+          fh:write(jpegBytes('fake-jpeg-' .. tostring(i), true, d[1], d[2]))
         end
         fh:close()
         return true, dest
@@ -548,7 +676,23 @@ check(msg(409, 'extension_already_used'):find('延長') ~= nil, 'describe: exten
 check(msg(409, nil):find('すでに終了') == nil, 'describe: unknown 409 is neutral')
 check(msg(422, 'card_required'):find('カード') ~= nil, 'describe: 422 card_required')
 check(msg(402, 'card_required'):find('カード') ~= nil, 'describe: 402 card_required')
-check(msg(402, 'monthly_limit'):find('月20単位') ~= nil, 'describe: 402 monthly_limit (initial invoice)')
+check(msg(402, 'monthly_limit'):find('上限') ~= nil and msg(402, 'monthly_limit'):find('%d') == nil,
+  'describe: 402 monthly_limit without the server text names no number')
+check(api.describe(402, 'monthly_limit', '初回請求の成功までは、月60単位が上限です。'):find('月60単位が上限です', 1, true) ~= nil,
+  'describe: 402 monthly_limit shows the server wording (the number is the server\'s)')
+check(api.describe(402, 'monthly_limit', 'monthly limit reached'):find('monthly limit') == nil,
+  'describe: monthly_limit does not show an English server text')
+check(msg(409, 'active_gallery_limit'):find('%d') == nil, 'describe: active_gallery_limit without a number from the server names none')
+check(msg(409, 'extension_already_used'):find('%d') == nil, 'describe: extension_already_used names no number')
+do
+  local long = '初回請求の成功までは、月60単位が上限です。' .. string.rep('あ', 400) .. '\r\n次の行'
+  local shown = api.describe(402, 'monthly_limit', long)
+  check(not shown:find('[\r\n]') and shown:find('…', 1, true) ~= nil and shown:find('次の行', 1, true) == nil,
+    'describe: the server text is one line and cut (no line breaks, "…")')
+  local _, chars = shown:gsub('[%z\1-\127\194-\244][\128-\191]*', '')
+  check(chars <= 300 + #'（ダッシュボード: https://papat.app/app）' + 1, 'describe: about 300 characters at most (' .. chars .. ')')
+  check(api.describe(402, nil, 'エ\nラ\nー'):find('[\r\n]') == nil, 'describe: a 402 text with line breaks is one line')
+end
 check(msg(402, 'card_required'):find('カード登録が必要') ~= nil and msg(402, 'card_required'):find('使い切りました') == nil, 'describe: card_required is not only "free galleries used up"')
 check(api.describe(402, 'paid_country_blocked', 'この国では有料利用に対応していません。'):find('この国では有料利用') ~= nil, 'describe: paid_country_blocked shows the server text')
 check(msg(402, 'paid_country_blocked'):find('請求先の国') ~= nil, 'describe: paid_country_blocked fallback')
@@ -594,7 +738,7 @@ activeCatalog = newCatalog(photos)
 run('CreateGallery.lua')
 check(photos[2].props.papatSid == 'SID9' and photos[1].props.papatSid == 'SID9', 'idempotency_conflict: user retry uploads both photos')
 
--- 4c. Key color (1.0.2): create + manifest carry #rrggbb, remembered in prefs
+-- 4c. Key color: not offered in the create dialog any more (1.1.0; it is set in the dashboard)
 -- ---------------------------------------------------------------------------
 local colorCreate, colorManifest
 env.server = function(req)
@@ -605,13 +749,13 @@ env.server = function(req)
   if req.method == 'PUT' and req.url:find('manifest%.json$') then colorManifest = json.decode(req.body) end
   return 200, { ok = true }
 end
--- the dialog stub accepts defaults; give the stubbed property table a color via the modal hook
 local realPresent = modules.LrDialogs.presentModalDialog
-env.injectKeyColor = '0066CC'
+local colorDialog
 modules.LrDialogs.presentModalDialog = function(args)
   if args.actionVerb == '作成して送信' and args.actionBinding then
-    local props = args.actionBinding.enabled.bind_to_object
-    props.keyColor = env.injectKeyColor
+    colorDialog = args
+    -- whatever a leftover property would say: the plug-in does not read a colour any more
+    args.actionBinding.enabled.bind_to_object.keyColor = '0066CC'
   end
   return realPresent(args)
 end
@@ -619,21 +763,25 @@ photos = { newPhoto('/p/IMG_0001.NEF') }
 activeCatalog = newCatalog(photos)
 env.prefs = { locationPromptShown = true, recentKeyColors = '#111111' }
 run('CreateGallery.lua')
-check(colorCreate and colorCreate.key_color == '#0066cc', 'color: create request carries #0066cc')
-check(colorManifest and colorManifest.key_color == '#0066cc', 'color: manifest carries #0066cc')
-check(env.prefs.recentKeyColors == '#0066cc,#111111', 'color: remembered in prefs')
-
--- invalid input is never sent: the dialog blocks (canSubmit) and the value falls back to none
-colorCreate, colorManifest = nil, nil
-env.injectKeyColor = 'blue'
-photos = { newPhoto('/p/IMG_0001.NEF') }
-activeCatalog = newCatalog(photos)
-env.prefs = { locationPromptShown = true }
-run('CreateGallery.lua')
-check(colorCreate and colorCreate.key_color == nil, 'color: invalid value is not sent')
-check(env.prefs.recentKeyColors == nil, 'color: invalid value is not remembered')
-
-env.injectKeyColor = ''
+check(colorCreate and colorCreate.key_color == nil, 'color: the create request carries no colour')
+check(colorManifest and colorManifest.key_color == nil, 'color: the manifest carries no colour')
+check(env.prefs.recentKeyColors == '#111111', 'color: the stored recent colours are left alone')
+do
+  -- nothing about a colour on the screen
+  local strings = {}
+  local function collect(node)
+    if type(node) ~= 'table' then return end
+    local args = node.args or node
+    if type(args.title) == 'string' then strings[#strings + 1] = args.title end
+    local value = args.value
+    if type(value) == 'table' and value.bound and value.bound.key == 'keyColor' then strings[#strings + 1] = 'BOUND:keyColor' end
+    for _, child in ipairs(args) do collect(child) end
+  end
+  collect(colorDialog and colorDialog.contents)
+  local joined = table.concat(strings, '\n')
+  check(joined ~= '' and not joined:find('色', 1, true) and not joined:find('#RRGGBB', 1, true)
+    and not joined:find('BOUND:keyColor', 1, true), 'color: the create dialog has no colour field, popup or text')
+end
 modules.LrDialogs.presentModalDialog = realPresent
 check(api.describe(400, 'invalid_request', 'key_color must be a #RRGGBB color'):find('#RRGGBB') ~= nil, 'describe: key_color error')
 
@@ -664,7 +812,7 @@ local function indexOfManifest(n)
 end
 local serverState
 local function bigServer()
-  serverState = { photos = {}, manifestCalls = 0, deleted = false, failName = nil }
+  serverState = { photos = {}, thumbs = {}, order = {}, times = {}, manifestCalls = 0, deleted = false, failName = nil }
   return function(req)
     if req.method == 'POST' and req.url:find('/galleries$') then
       return 201, { ok = true, sid = 'SIDP', tenant_id = 'abc123', path = '/t/abc123/s/SIDP', expires_at = iso(7) }
@@ -675,6 +823,23 @@ local function bigServer()
         return 409, { ok = false, code = 'gallery_closed', error = 'closed' }
       end
       serverState.photos[#serverState.photos + 1] = req.url
+      serverState.order[#serverState.order + 1] = 'photo:' .. req.url:match('[^/]*$')
+      serverState.times[#serverState.order] = env.clock or 0
+      return 200, { ok = true }
+    end
+    if req.method == 'PUT' and req.url:find('/files/thumbs/') then
+      local name = req.url:match('[^/]*$')
+      serverState.order[#serverState.order + 1] = 'thumb:' .. name
+      serverState.times[#serverState.order] = env.clock or 0
+      serverState.thumbPuts = (serverState.thumbPuts or 0) + 1
+      if serverState.thumb429First and serverState.thumbPuts == 1 then
+        -- a server that still counts the small versions: 429 with Retry-After
+        return 429, { ok = false, code = 'rate_limited', error = 'rate limit exceeded' }, { { field = 'Retry-After', value = '2' } }
+      end
+      if serverState.thumbStatus then
+        return serverState.thumbStatus, { ok = false, code = serverState.thumbCode, error = 'refused' }
+      end
+      serverState.thumbs[#serverState.thumbs + 1] = { url = req.url, body = req.body, type = req.headers }
       return 200, { ok = true }
     end
     return 200, { ok = true }
@@ -816,6 +981,555 @@ for _, b in ipairs(bodies) do
 end
 check(previews == 3, 'fast: three JPEGs came from the preview')
 env.prefs = { locationPromptShown = true }
+
+-- 1.1.0: sending from the preview is the default; "export this time" overrides it
+do
+  env.rawPrefs = true
+  local configLib = dofile(_PLUGIN.path .. '/lib/config.lua')
+
+  -- a fastMode=false stored by 1.0.x is dropped once; a choice made afterwards is kept
+  env.prefs = { locationPromptShown = true, fastMode = false }
+  check(configLib.settings().fastMode == true, 'default: preview first, even over a stored false from 1.0.x')
+  check(env.prefs.fastMode == nil and env.prefs.fastModeDefaultV110 == true, 'default: the old value is dropped once')
+  env.prefs.fastMode = false -- switched off in the plug-in manager afterwards
+  check(configLib.settings().fastMode == false, 'default: a later choice is kept')
+  env.prefs = { locationPromptShown = true }
+  check(configLib.settings().fastMode == true, 'default: nothing stored = preview')
+
+  -- the create dialog: a check box "export this time"; nothing changes when it is left alone
+  local function checkboxes(node, out)
+    out = out or {}
+    if type(node) ~= 'table' then return out end
+    local args = node.args or node
+    if node.kind == 'checkbox' then out[#out + 1] = args end
+    for _, child in ipairs(args) do checkboxes(child, out) end
+    return out
+  end
+  local exportNowAnswer = false
+  local presentBefore = modules.LrDialogs.presentModalDialog
+  local lastCreateDialog
+  modules.LrDialogs.presentModalDialog = function(args)
+    if args.actionVerb == '作成して送信' and args.actionBinding then
+      lastCreateDialog = args
+      args.actionBinding.enabled.bind_to_object.exportNow = exportNowAnswer
+    end
+    return presentBefore(args)
+  end
+  local function createWith(prefs, answer)
+    photos = manyPhotos(3)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = prefs
+    env.passwords.recentGalleries = nil
+    env.thumbRequests, env.exportedCount = 0, 0
+    exportNowAnswer = answer
+    lastCreateDialog = nil
+    run('CreateGallery.lua')
+  end
+
+  createWith({ locationPromptShown = true }, false)
+  check(env.thumbRequests == 3 and env.exportedCount == 0,
+    'default: the three photos come from the preview (' .. env.thumbRequests .. '/' .. env.exportedCount .. ')')
+  local boxes = lastCreateDialog and checkboxes(lastCreateDialog.contents) or {}
+  check(#boxes == 1 and tostring(boxes[1].title):find('この回だけ', 1, true) ~= nil,
+    'default: the create dialog has the "export this time" check box')
+
+  createWith({ locationPromptShown = true }, true)
+  check(env.thumbRequests == 0 and env.exportedCount == 3,
+    'export this time: all three are exported (' .. env.thumbRequests .. '/' .. env.exportedCount .. ')')
+
+  -- preview switched off in the manager: always exported, no check box
+  createWith({ locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true }, false)
+  check(env.thumbRequests == 0 and env.exportedCount == 3, 'switched off: exported')
+  check(lastCreateDialog and #checkboxes(lastCreateDialog.contents) == 0, 'switched off: no check box')
+
+  modules.LrDialogs.presentModalDialog = presentBefore
+  env.rawPrefs = nil
+  env.prefs = { locationPromptShown = true }
+end
+
+-- Small versions for the gallery's overview (1.1.0): thumbs/<same name>, after the photo
+do
+  env.rawPrefs = true
+  local function thumbRun(prefs, setup)
+    photos = manyPhotos(4)
+    if setup then setup(photos) end
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = prefs or { locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true }
+    env.passwords.recentGalleries = nil
+    env.commands, env.sipsCalls, env.sipsFilesSeen, env.sipsSizes, env.sipsMode = {}, 0, 0, {}, nil
+    env.sleeps, env.logLines = {}, {}
+    run('CreateGallery.lua')
+  end
+  local function manifestEntries()
+    local out = {}
+    for _, m in ipairs(manifestRequests()) do for _, p in ipairs(m.photos) do out[p.filename] = p end end
+    return out
+  end
+  local function hasString(body, needle) return body:find(needle, 1, true) ~= nil end
+
+  local thumbModule = dofile(_PLUGIN.path .. '/lib/thumb.lua')
+  check(thumbModule.targetLong(2048, 1365) == 600 and thumbModule.targetLong(1365, 2048) == 600
+    and thumbModule.targetLong(3000, 1000) == 800 and thumbModule.targetLong(4000, 4000) == 400
+    and thumbModule.targetLong(600, 400) == nil and thumbModule.targetLong(380, 570) == nil
+    and thumbModule.targetLong(0, 0) == nil, 'thumbs: target sizes (short edge 400, long edge at most 800, never enlarged)')
+
+  -- every photo gets one: made from the JPEG that was sent, short edge 400 / long edge <= 800
+  thumbRun()
+  check(#serverState.photos == 4 and #serverState.thumbs == 4, 'thumbs: four photos, four small versions ('
+    .. #serverState.photos .. '/' .. #serverState.thumbs .. ')')
+  local first = serverState.thumbs[1]
+  check(first and first.url:find('/galleries/SIDP/files/thumbs/IMG_000%d%.jpg$') ~= nil, 'thumbs: PUT .../files/thumbs/<same name>')
+  check(first and first.body:sub(1, 3) == '\255\216\255', 'thumbs: a JPEG')
+  check(first and #first.body <= 256 * 1024, 'thumbs: at most 256 KB')
+  check(first and not hasString(first.body, 'SerialNumber') and not hasString(first.body, 'GPSLatitude'),
+    'thumbs: the Exif that sips adds is removed again')
+  check(first and hasString(first.body, 'ICC_PROFILE'), 'thumbs: carries the sRGB profile like the big one')
+  local ok600 = true
+  for _, size in ipairs(env.sipsSizes) do
+    if math.max(size[1], size[2]) ~= 600 or math.min(size[1], size[2]) ~= 400 then ok600 = false end
+  end
+  check(ok600 and #env.sipsSizes == 4, 'thumbs: 2048x1365 becomes 600x400 (short edge 400)')
+  local sipsCommand
+  for _, command in ipairs(env.commands) do if command:find('^sips ') then sipsCommand = command; break end end
+  check(sipsCommand and sipsCommand:find('-Z 600', 1, true) and sipsCommand:find('formatOptions 80', 1, true),
+    'thumbs: sips -Z 600 ... formatOptions 80')
+
+  -- photo first, then its small version (the server refuses a small version without its photo)
+  local seen, orderOk = {}, true
+  for _, event in ipairs(serverState.order) do
+    local kind, name = event:match('^(%a+):(.+)$')
+    if kind == 'thumb' and not seen[name] then orderOk = false end
+    if kind == 'photo' then seen[name] = true end
+  end
+  check(orderOk and #serverState.order == 8, 'thumbs: every small version goes after its photo')
+
+  -- the manifest says where they are
+  local entries = manifestEntries()
+  local linked = 0
+  for name, entry in pairs(entries) do
+    if entry.thumb == 'thumbs/' .. name then linked = linked + 1 end
+  end
+  check(linked == 4, 'thumbs: manifest entries carry thumb = thumbs/<name> (' .. linked .. ')')
+
+  -- the small versions are made in batches by sips (one call for many files) and sent by their own
+  -- tasks; photos are started at least 0.22 s apart
+  do
+    local photoTimes, gapsOk = {}, true
+    for i, event in ipairs(serverState.order) do
+      if event:find('^photo:') then photoTimes[#photoTimes + 1] = serverState.times[i] end
+    end
+    for i = 2, #photoTimes do
+      if photoTimes[i] - photoTimes[i - 1] < 0.21 then gapsOk = false end
+    end
+    check(gapsOk and #photoTimes == 4, 'thumbs: photos keep the 0.22 s interval')
+    check(env.sipsCalls >= 1 and env.sipsCalls <= 2 and env.sipsFilesSeen == 4,
+      'thumbs: four files in one or two sips calls, not one call each (' .. tostring(env.sipsCalls) .. ' calls, '
+        .. tostring(env.sipsFilesSeen) .. ' files)')
+  end
+
+  -- an older server that counts them: 429 -> Retry-After is waited out, and from then on the
+  -- small versions keep the interval too. The photos are not stopped.
+  do
+    photos = manyPhotos(5)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    serverState.thumb429First = true
+    env.prefs = { locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true }
+    env.passwords.recentGalleries = nil
+    env.sleeps, env.logLines = {}, {}
+    run('CreateGallery.lua')
+    check(#serverState.photos == 5 and #serverState.thumbs == 5,
+      'thumbs 429: all photos and all small versions arrive (' .. #serverState.photos .. '/' .. #serverState.thumbs .. ')')
+    local waitedRetryAfter = false
+    for _, d in ipairs(env.sleeps) do if d >= 2 then waitedRetryAfter = true end end
+    check(waitedRetryAfter, 'thumbs 429: Retry-After is waited out')
+    -- (the interval itself is not asserted here: the fake clock only advances when a task sleeps, so
+    -- the times of concurrent workers are not comparable; the log line says the small versions
+    -- switched to the interval)
+    local pacedLogged = false
+    for _, line in ipairs(env.logLines) do if line:find('paced=true', 1, true) then pacedLogged = true end end
+    check(pacedLogged, 'thumbs 429: the log says the small versions were paced')
+    serverState.thumb429First = nil
+  end
+
+  -- a photo that is already small gets none
+  thumbRun(nil, function(list) list[1].exportDims = { 600, 400 }; list[2].exportDims = { 380, 570 } end)
+  check(#serverState.photos == 4 and #serverState.thumbs == 2, 'thumbs: small photos get none (' .. #serverState.thumbs .. ')')
+  entries = manifestEntries()
+  check(entries['IMG_0001.jpg'] and entries['IMG_0001.jpg'].thumb == nil, 'thumbs: no thumb key for a small photo')
+
+  -- portrait and wide: the short edge is 400 up to a long edge of 800
+  thumbRun(nil, function(list) list[1].exportDims = { 1365, 2048 }; list[2].exportDims = { 3000, 1000 } end)
+  local sized = {}
+  for _, size in ipairs(env.sipsSizes) do sized[#sized + 1] = size[1] .. 'x' .. size[2] end
+  table.sort(sized)
+  check(table.concat(sized, ',') == '400x600,600x400,600x400,800x267', 'thumbs: portrait 400x600, 3:1 long edge 800 ('
+    .. table.concat(sized, ',') .. ')')
+
+  -- a small version that cannot be made never fails the photo
+  local function modeRun(mode)
+    photos = manyPhotos(5)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = { locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true }
+    env.passwords.recentGalleries = nil
+    env.commands, env.sipsCalls, env.sipsSizes = {}, 0, {}
+    env.sipsMode = mode
+    env.logLines = {}
+    run('CreateGallery.lua')
+    env.sipsMode = nil
+  end
+  for _, mode in ipairs({ 'fail', 'garbage', 'wide', 'big' }) do
+    modeRun(mode)
+    check(#serverState.photos == 5 and #serverState.thumbs == 0, 'thumbs: ' .. mode .. ': all photos sent, no small version ('
+      .. #serverState.photos .. '/' .. #serverState.thumbs .. ')')
+    local ms = manifestRequests()
+    check(ms[#ms] and ms[#ms].complete == true, 'thumbs: ' .. mode .. ': the gallery is completed')
+    -- the batch fails as a whole (five failures in a row): no more attempts in this send
+    check(env.sipsCalls >= 1 and env.sipsCalls <= 2,
+      'thumbs: ' .. mode .. ': gives up after the failed batch (' .. env.sipsCalls .. ' calls)')
+  end
+
+  -- the server refuses them (an older server: 415 unsupported_media_type): photos go on, no more tries
+  photos = manyPhotos(6)
+  activeCatalog = newCatalog(photos)
+  env.server = bigServer()
+  serverState.thumbStatus, serverState.thumbCode = 415, 'unsupported_media_type'
+  env.prefs = { locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true }
+  env.passwords.recentGalleries = nil
+  env.commands = {}
+  run('CreateGallery.lua')
+  local thumbPuts = 0
+  for _, event in ipairs(serverState.order) do if event:find('^thumb:') then thumbPuts = thumbPuts + 1 end end
+  check(#serverState.photos == 6 and thumbPuts >= 3 and thumbPuts <= 5, 'thumbs: refused: three or four tries, then none (' .. thumbPuts .. ')')
+  local entries2 = manifestEntries()
+  local anyThumb = false
+  for _, entry in pairs(entries2) do if entry.thumb then anyThumb = true end end
+  check(not anyThumb, 'thumbs: refused: the manifest names none')
+
+  -- off in the preferences: nothing is made
+  thumbRun({ locationPromptShown = true, fastMode = false, fastModeDefaultV110 = true, thumbs = false })
+  check(#serverState.thumbs == 0 and env.sipsCalls == 0, 'thumbs: switched off = none')
+
+  -- from the preview (the default): the small version is Lightroom's small preview (no sips)
+  local function previewRun(setup, prefs, mode)
+    photos = manyPhotos(6)
+    if setup then setup(photos) end
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = prefs or { locationPromptShown = true }
+    env.passwords.recentGalleries = nil
+    env.commands, env.sipsCalls, env.sipsFilesSeen, env.sipsSizes, env.sipsMode = {}, 0, 0, {}, nil
+    env.smallRequests, env.thumbRequests, env.exportedCount, env.smallMode = 0, 0, 0, mode
+    env.sleeps, env.logLines = {}, {}
+    run('CreateGallery.lua')
+    env.smallMode = nil
+  end
+  local function logHas(part)
+    for _, line in ipairs(env.logLines) do if line:find(part, 1, true) then return line end end
+  end
+  local function dims(bytes)
+    local info = dofile(_PLUGIN.path .. '/lib/jpeg.lua').parse(bytes)
+    return info and info.width, info and info.height
+  end
+
+  previewRun()
+  check(#serverState.photos == 6 and #serverState.thumbs == 6, 'small versions (preview send): six photos, six small versions ('
+    .. #serverState.photos .. '/' .. #serverState.thumbs .. ')')
+  -- Lightroom's small previews are never asked for (they can stay old after an edit while the big
+  -- one is new): the small version always comes from the bytes that were sent, through sips
+  check(env.smallRequests == 0, 'small versions: no small preview is requested (' .. env.smallRequests .. ' requests)')
+  check(env.sipsCalls >= 1 and env.sipsCalls <= 2 and env.sipsFilesSeen == 6,
+    'small versions: six files in one or two sips calls (' .. env.sipsCalls .. ' calls, ' .. env.sipsFilesSeen .. ' files)')
+  local w, h = dims(serverState.thumbs[1].body)
+  check(w == 600 and h == 400, 'small versions: the 2056x1371 preview becomes 600x400 (' .. tostring(w) .. 'x' .. tostring(h) .. ')')
+  check(not hasString(serverState.thumbs[1].body, 'SerialNumber') and hasString(serverState.thumbs[1].body, 'ICC_PROFILE'),
+    'small versions: cleaned, with the sRGB profile')
+  check(logHas('probe small preview') == nil and logHas('small versions: from the preview') == nil,
+    'small versions: no small-preview probe in the log')
+  check(logHas('pipeline small versions: sent=6 none=0') ~= nil, 'small versions: the log counts them')
+  check(logHas('pipeline times: photoPUT=') ~= nil and logHas('thumbPUT=') ~= nil and logHas('sips=') ~= nil
+    and logHas('smallPreview=') == nil, 'small versions: the log has the time breakdown')
+  local entriesP = manifestEntries()
+  local linkedP, extraKeys = 0, false
+  for name, entry in pairs(entriesP) do
+    if entry.thumb == 'thumbs/' .. name then linkedP = linkedP + 1 end
+    for key in pairs(entry) do if key == 'thumbPublished' then extraKeys = true end end
+  end
+  check(linkedP == 6, 'small preview: the manifest names all six (' .. linkedP .. ')')
+  check(not extraKeys, 'small preview: nothing internal leaks into the manifest entries')
+
+  -- a small version that arrives while a manifest PUT is waiting is not in that body: it must be
+  -- added by the late pass (audit 11)
+  env.yieldOnManifest, env.thumbPutYields = 40, 3 -- the manifest PUT waits much longer than a small version's PUT
+  previewRun()
+  env.yieldOnManifest, env.thumbPutYields = nil, nil
+  do
+    local entriesY = manifestEntries()
+    local linkedY = 0
+    for name, entry in pairs(entriesY) do
+      if entry.thumb == 'thumbs/' .. name then linkedY = linkedY + 1 end
+    end
+    check(#serverState.thumbs == 6 and linkedY == 6,
+      'small versions: a small version that came in during a manifest PUT is added later (' .. linkedY .. ' of 6)')
+  end
+
+  -- the late pass leaves key_color to the server (the colour may have been changed in the browser
+  -- meanwhile). A gallery made by an earlier version has a colour of its own: resume it with one.
+  do
+    photos = manyPhotos(6)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = { locationPromptShown = true }
+    env.passwords.recentGalleries = nil
+    local senderLib = dofile(_PLUGIN.path .. '/lib/sender.lua')
+    local items = {}
+    for i, photo in ipairs(photos) do items[i] = { photo = photo, sourceId = 'src-' .. i } end
+    senderLib.start {
+      apiKey = KEY, sid = 'SIDP', title = 'Resumed', keyColor = '#0066cc',
+      items = items, usedNames = {}, status = senderLib.newStatus('x'), total = 6, alreadyUploaded = 0,
+      rightsMode = 'none', fast = true,
+    }
+    drain()
+    local withColor, passes = 0, 0
+    for _, m in ipairs(manifestRequests()) do
+      if m.key_color == '#0066cc' then withColor = withColor + 1 end
+      local onlyThumbs = #m.photos > 0
+      for _, p in ipairs(m.photos) do if not p.thumb then onlyThumbs = false end end
+      if onlyThumbs and not m.key_color then passes = passes + 1 end
+    end
+    check(withColor >= 1 and passes >= 1,
+      'small versions: manifests carry the gallery colour, the late pass (only entries with thumb) does not ('
+        .. withColor .. ' with, ' .. passes .. ' late passes without)')
+    check(manifestRequests()[#manifestRequests()].title == 'Resumed', 'small versions: the late pass keeps the title')
+  end
+
+  -- "export this time": photos are exported, the small versions come from the exported files via sips
+  do
+    photos = manyPhotos(4)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = { locationPromptShown = true }
+    env.passwords.recentGalleries = nil
+    env.commands, env.sipsCalls, env.sipsFilesSeen, env.smallRequests, env.exportedCount = {}, 0, 0, 0, 0
+    env.logLines = {}
+    local presentBefore2 = modules.LrDialogs.presentModalDialog
+    modules.LrDialogs.presentModalDialog = function(args)
+      if args.actionVerb == '作成して送信' and args.actionBinding then
+        args.actionBinding.enabled.bind_to_object.exportNow = true
+      end
+      return presentBefore2(args)
+    end
+    run('CreateGallery.lua')
+    modules.LrDialogs.presentModalDialog = presentBefore2
+    check(env.exportedCount == 4 and env.smallRequests == 0 and env.sipsCalls >= 1 and #serverState.thumbs == 4,
+      'small versions: exporting this time = small versions through sips (' .. env.smallRequests .. ' small requests, '
+        .. env.sipsCalls .. ' sips calls, ' .. #serverState.thumbs .. ' small versions)')
+  end
+
+  env.rawPrefs = nil
+  env.prefs = { locationPromptShown = true }
+end
+
+-- Announcement template (1.1.0): used by the create dialog, kept from the result window, edited in the manager
+do
+  local function findButton(node, titlePart, out)
+    if type(node) ~= 'table' then return out end
+    local args = node.args or node
+    if node.kind == 'push_button' and tostring(args.title):find(titlePart, 1, true) then return args end
+    for _, child in ipairs(args) do
+      local found = findButton(child, titlePart)
+      if found then return found end
+    end
+    return out
+  end
+  local function createWith(prefs)
+    photos = manyPhotos(2)
+    activeCatalog = newCatalog(photos)
+    env.server = bigServer()
+    env.prefs = prefs
+    env.passwords.recentGalleries = nil
+    run('CreateGallery.lua')
+    return lastDialog('modal')
+  end
+
+  -- default: the usual text
+  local result = createWith({ locationPromptShown = true })
+  local resultProps = result.args.contents.args.bind_to_object
+  check(resultProps.guidance:find('写真をお送りします。', 1, true) == 1
+    and resultProps.guidance:find('公開期限: ', 1, true) ~= nil
+    and resultProps.guidance:find('ブラウザで開いて', 1, true) ~= nil, 'template: the default text in the result window')
+
+  -- an own template in the preferences
+  result = createWith({ locationPromptShown = true,
+    announcementTemplate = '{題} の選定をお願いします。\nここです→ {URL}\n合言葉: {パスコード}' })
+  resultProps = result.args.contents.args.bind_to_object
+  check(resultProps.guidance:find('の選定をお願いします。', 1, true) ~= nil
+    and resultProps.guidance:find('合言葉: ', 1, true) ~= nil
+    and resultProps.guidance:find('写真をお送りします', 1, true) == nil, 'template: the own template is used')
+
+  -- a broken template (no marks at all) still gives a usable text
+  result = createWith({ locationPromptShown = true, announcementTemplate = 'よろしくお願いします。' })
+  resultProps = result.args.contents.args.bind_to_object
+  check(resultProps.guidance:find('よろしくお願いします。', 1, true) == 1
+    and resultProps.guidance:find('URL: https://', 1, true) ~= nil
+    and resultProps.guidance:find('パスコード: ', 1, true) ~= nil, 'template: a template without marks gets the URL and passcode')
+
+  -- result window: edit the text, press "この文面を、次回から使う"
+  result = createWith({ locationPromptShown = true })
+  resultProps = result.args.contents.args.bind_to_object
+  resultProps.guidance = '春のご案内です。\n' .. resultProps.url .. '\nパスコードは ' .. resultProps.passcode .. ' です。'
+  local save = findButton(result.args.contents, 'この文面を、次回から使う')
+  check(save ~= nil, 'template: the result window has the "use this wording next time" button')
+  save.action()
+  check(env.prefs.announcementTemplate == '春のご案内です。\n{URL}\nパスコードは {パスコード} です。',
+    'template: the edited wording is stored as a template (' .. tostring(env.prefs.announcementTemplate) .. ')')
+  result = createWith(env.prefs)
+  resultProps = result.args.contents.args.bind_to_object
+  check(resultProps.guidance:find('春のご案内です。', 1, true) == 1 and resultProps.guidance:find('パスコードは ', 1, true) ~= nil,
+    'template: the next gallery uses the stored wording')
+
+  -- plug-in manager: a field with the stored (or default) text, a reset button, and the preference follows
+  env.prefs = { locationPromptShown = true, announcementTemplate = '保存済みの文 {URL}' }
+  local observers = {}
+  local mgrProps = setmetatable({}, { __index = function(_, k)
+    if k == 'addObserver' then return function(_, key, fn) observers[key] = fn end end
+  end })
+  env.passwords.apiKey = KEY
+  local sectionsList = dofile(_PLUGIN.path .. '/PluginInfoProvider.lua').sectionsForTopOfDialog(fakeFactory(), mgrProps)
+  walkLayout(sectionsList, 'manager (announcement)')
+  check(mgrProps.announcementTemplate == '保存済みの文 {URL}', 'template: the manager shows the stored text')
+  local reset = findButton(sectionsList, 'もとの文に戻す')
+  check(reset ~= nil, 'template: the manager has a reset button')
+  reset.action()
+  mgrProps.announcementTemplate = mgrProps.announcementTemplate -- (the observer is called by Lightroom)
+  observers.announcementTemplate()
+  check(env.prefs.announcementTemplate == nil, 'template: reset = the default again (nothing stored)')
+  mgrProps.announcementTemplate = '{題}\n{URL}\n{パスコード}'
+  observers.announcementTemplate()
+  check(env.prefs.announcementTemplate == '{題}\n{URL}\n{パスコード}', 'template: an edit in the manager is stored')
+  mgrProps.announcementTemplate = '   '
+  observers.announcementTemplate()
+  check(env.prefs.announcementTemplate == nil, 'template: an emptied field means the default')
+
+
+  -- Editing the text (1.1.0). The SDK has no way to type a line break in an edit field (Return presses the
+  -- default button): the field sits in a scrolling window, "編集中" stops the closing button, and the text
+  -- editor is offered.
+  do
+    local function findKind(node, kind, acc)
+      acc = acc or {}
+      if type(node) ~= 'table' then return acc end
+      local args = node.args or node
+      if node.kind == kind then acc[#acc + 1] = args end
+      for _, child in ipairs(args) do findKind(child, kind, acc) end
+      return acc
+    end
+    local function openCommand()
+      for i = #env.commands, 1, -1 do
+        local path = env.commands[i]:match("^open %-t '([^']+)'")
+        if path then return path end
+      end
+    end
+    local editResult = createWith({ locationPromptShown = true })
+    local contents = editResult.args.contents
+    local editProps = contents.args.bind_to_object
+
+    -- a scrolling window onto a field that is taller than the window
+    local windowed = false
+    for _, view in ipairs(findKind(contents, 'scrolled_view')) do
+      for _, field in ipairs(findKind(view, 'edit_field')) do
+        if type(field.value) == 'table' and field.value.bound.key == 'guidance' and (field.height_in_lines or 0) > 9 then
+          windowed = true
+        end
+      end
+    end
+    check(windowed, 'edit: the announcement field is a tall field in a scrolling window')
+
+    -- the closing button follows "編集中"
+    local binding = editResult.args.actionBinding
+    check(binding and binding.enabled and binding.enabled.key == 'canClose', 'edit: the closing button is bound to canClose')
+    check(editProps.canClose == true, 'edit: closing is possible by default')
+    editProps.editing = true
+    check(editProps.canClose == false, 'edit: "編集中" disables the closing button (Return cannot close the window)')
+    editProps.editing = false
+    check(editProps.canClose == true, 'edit: and enables it again')
+
+    -- the text editor: write, open, read back
+    local before = editProps.guidance
+    local openButton = findButton(contents, 'テキストエディタで開く')
+    check(openButton ~= nil, 'edit: a "open in the text editor" button')
+    openButton.action()
+    drain()
+    local path = openCommand()
+    check(path ~= nil and path:find('papat%-announcement%.txt$') ~= nil, 'edit: `open -t` is run on a .txt file')
+    local fh = path and io.open(path, 'rb')
+    check(fh and fh:read('*a') == before, 'edit: the file holds the current text')
+    if fh then fh:close() end
+    local out = io.open(path, 'wb')
+    out:write('\239\187\191新しい文\r\n二行目')
+    out:close()
+    local readButton = findButton(contents, '編集した内容を反映')
+    readButton.action()
+    check(editProps.guidance == '新しい文\n二行目', 'edit: what was saved comes back (BOM and CRLF removed)')
+    out = io.open(path, 'wb'); out:write('   '); out:close()
+    editProps.guidance = 'そのまま'
+    readButton.action()
+    check(editProps.guidance == 'そのまま', 'edit: an empty file does not wipe the text')
+
+    -- "最近のギャラリー" has the same field
+    env.passwords.recentGalleries = nil
+    createWith({ locationPromptShown = true })
+    env.dialogs = {}
+    run('RecentGalleries.lua')
+    local recent = lastDialog('modal')
+    check(recent and recent.args.actionBinding and recent.args.actionBinding.enabled.key == 'canClose',
+      'edit: the recent galleries window has the same closing-button rule')
+  end
+
+  -- plug-in manager: tall field in a window, the editor buttons write and read the template
+  do
+    local function findKindM(node, kind, acc)
+      acc = acc or {}
+      if type(node) ~= 'table' then return acc end
+      local args = node.args or node
+      if node.kind == kind then acc[#acc + 1] = args end
+      for _, child in ipairs(args) do findKindM(child, kind, acc) end
+      return acc
+    end
+    env.prefs = { locationPromptShown = true }
+    local observersM = {}
+    local mgr = setmetatable({}, { __index = function(_, k)
+      if k == 'addObserver' then return function(_, key, fn) observersM[key] = fn end end
+    end })
+    env.passwords.apiKey = KEY
+    local sectionsM = dofile(_PLUGIN.path .. '/PluginInfoProvider.lua').sectionsForTopOfDialog(fakeFactory(), mgr)
+    local windowedM = false
+    for _, view in ipairs(findKindM(sectionsM, 'scrolled_view')) do
+      for _, field in ipairs(findKindM(view, 'edit_field')) do
+        if type(field.value) == 'table' and field.value.bound.key == 'announcementTemplate' and (field.height_in_lines or 0) > 8 then
+          windowedM = true
+        end
+      end
+    end
+    check(windowedM, 'edit: the manager field is a tall field in a scrolling window')
+    local openM = findButton(sectionsM, 'テキストエディタで開く')
+    local readM = findButton(sectionsM, '編集した内容を反映')
+    check(openM ~= nil and readM ~= nil, 'edit: the manager has the text editor buttons')
+    env.commands = {}
+    openM.action()
+    drain()
+    local pathM
+    for _, command in ipairs(env.commands) do pathM = pathM or command:match("^open %-t '([^']+)'") end
+    check(pathM and pathM:find('papat%-announcement%-template%.txt$') ~= nil, 'edit: the manager writes its own file')
+    local outM = io.open(pathM, 'wb'); outM:write('{題}\n\n{URL}\nパスコード {パスコード}'); outM:close()
+    readM.action()
+    check(mgr.announcementTemplate == '{題}\n\n{URL}\nパスコード {パスコード}', 'edit: the template comes back from the editor')
+  end
+  env.prefs = { locationPromptShown = true }
+end
 
 -- exported file that cannot be cleaned is NOT sent (fail closed), the others are
 photos = { newPhoto('/p/IMG_0001.NEF'), newPhoto('/p/IMG_0002.NEF'), newPhoto('/p/IMG_0003.NEF') }
@@ -1530,9 +2244,10 @@ do
   local titles = {}
   for _, sec in ipairs(sections) do titles[#titles + 1] = sec.title end
   check(titles[1] == 'papat — インストール場所' and titles[2] == 'papat — 接続' and titles[3] == 'papat — アタリ送付'
-    and titles[4] == 'papat — セレクト受け取り 反映設定', 'manager (not standard): location, connect, send, receive (' .. table.concat(titles, ' | ') .. ')')
+    and titles[4] == 'papat — 案内文（クライアントに送る文面）' and titles[5] == 'papat — セレクト受け取り 反映設定',
+    'manager (not standard): location, connect, send, wording, receive (' .. table.concat(titles, ' | ') .. ')')
 end
-check(type(sections) == 'table' and #sections == 5, 'manager: five sections (location first when not standard)')
+check(type(sections) == 'table' and #sections == 6, 'manager: six sections (location first when not standard)')
 check(props.keyStatus and props.keyStatus:find('設定済み') ~= nil and not props.keyStatus:find('EXAMPLEKEY'), 'manager: key masked')
 check(props.applyPick == true and props.applyMemo == true and props.applyTags == true and props.starCollections == false, 'manager: defaults (pick/memo/tags on, star sub-collections off)')
 
@@ -1668,12 +2383,12 @@ do
   end })
   local secs = provider.sectionsForTopOfDialog(fakeFactory(), propsStd)
   walkLayout(secs, 'manager (standard location)')
-  check(#secs == 4, 'manager (standard): no location section')
+  check(#secs == 5, 'manager (standard): no location section')
 do
   local titles = {}
   for _, sec in ipairs(secs) do titles[#titles + 1] = sec.title end
-  check(table.concat(titles, ' | ') == 'papat — 接続 | papat — アタリ送付 | papat — セレクト受け取り 反映設定 | papat — バージョン',
-    'manager: sections in the order connect, send, receive, version (' .. table.concat(titles, ' | ') .. ')')
+  check(table.concat(titles, ' | ') == 'papat — 接続 | papat — アタリ送付 | papat — 案内文（クライアントに送る文面） | papat — セレクト受け取り 反映設定 | papat — バージョン',
+    'manager: sections in the order connect, send, wording, receive, version (' .. table.concat(titles, ' | ') .. ')')
 end
   check(propsStd.locationWarn == false and propsStd.locationStandard == true, 'manager (standard): no warning')
   check(propsStd.locationText == '標準の場所にインストールされています。', 'manager (standard): one line text')
@@ -1770,6 +2485,224 @@ do
   env.updateCheckLive = false
 end
 
+-- The photo limit before creating: the server's max_photos (status), 900 until it says (1.1.0)
+do
+  env.updateCheckLive = true
+  local function limitRun(maxPhotos, count)
+    photos = manyPhotos(count)
+    activeCatalog = newCatalog(photos)
+    env.prefs = { locationPromptShown = true }
+    env.passwords.recentGalleries = nil
+    local creates = 0
+    env.server = function(req)
+      if req.url:find('/integration/status') then
+        return 200, { ok = true, tenant_id = 'abc123', client = {}, max_photos = maxPhotos }
+      end
+      if req.method == 'POST' and req.url:find('/galleries$') then
+        creates = creates + 1
+        return 201, { ok = true, sid = 'SIDL', tenant_id = 'abc123', path = '/t/abc123/s/SIDL', expires_at = iso(7) }
+      end
+      return 200, { ok = true, galleries = {} }
+    end
+    env.dialogs = {}
+    run('CreateGallery.lua')
+    return creates, lastDialog('message')
+  end
+
+  -- below the auto-split trigger (888): the old hard limit still applies as a plain refusal
+  local creates, msg = limitRun(50, 60)
+  check(creates == 0 and msg and msg.title == '写真が多すぎます' and msg.info:find('50 枚まで', 1, true)
+    and msg.info:find('現在 60 枚', 1, true), 'limit: the server\'s max_photos (50) is the limit and is in the sentence')
+  creates = limitRun(50, 40)
+  check(creates == 1, 'limit: 40 photos are fine under a limit of 50')
+
+  -- above 888: 1.2.0's auto-split (lib/split.lua) tries first; these photos are all undated
+  -- (manyPhotos never sets a capture time), so it falls back to a fixed cut at 888 — a
+  -- remainder under 100 merges back into one gallery, 100 or more stays split
+  creates, msg = limitRun(nil, 901)
+  check(creates == 1 and msg == nil,
+    'limit: 901 undated photos (888+13) merges back to one gallery (1000 until the server says)')
+  creates, msg = limitRun('junk', 901)
+  check(creates == 1 and msg == nil, 'limit: a max_photos that makes no sense is ignored the same way')
+  creates = limitRun(1200, 1000)
+  check(creates == 2, 'limit: 1000 undated photos (888+112) split into two galleries even though 1200 would fit one')
+
+  -- a custom max_photos too small even for the auto-split's own target (888) still refuses
+  -- cleanly instead of sending an oversized gallery (lib/split.lua's own clamp keeps every
+  -- segment at or under max_photos; this is CreateGallery.lua's defensive check on top of it)
+  creates, msg = limitRun(500, 1000)
+  check(creates == 2, 'limit: a small max_photos (500) still splits, just into smaller pieces')
+
+  env.updateCheckLive = false
+  env.prefs = { locationPromptShown = true }
+end
+
+-- ---------------------------------------------------------------------------
+-- Auto-split (1.2.0): the settings dialog's one-line notice, two galleries with suffixed
+-- titles, one combined multi-URL invitation, two "最近のギャラリー" entries, and the manifest
+-- group numbers restarting at 1 for the second gallery. 900 photos with a deliberate one-hour
+-- gap at position 800 (well inside lib/split.lua's [750,888] range), so the cut is a real time
+-- group boundary rather than the "no information at all" fallback already covered above.
+-- ---------------------------------------------------------------------------
+do
+  local function photoAt(path, wallTime)
+    local p = newPhoto(path)
+    p.raw.dateTimeISO8601 = wallTime
+    return p
+  end
+  local splitPhotos, t = {}, 1790000000
+  for i = 1, 900 do
+    if i == 801 then t = t + 3600 end -- the one boundary: 1 hour, against ~10s elsewhere
+    splitPhotos[i] = photoAt(string.format('/p/s%04d.NEF', i), os.date('!%Y-%m-%dT%H:%M:%S', t))
+    t = t + 10
+  end
+  activeCatalog = newCatalog(splitPhotos)
+  env.passwords.recentGalleries = nil
+  env.prefs = { locationPromptShown = true }
+
+  local sidCount, createdTitles = 0, {}
+  env.server = function(req)
+    if req.method == 'POST' and req.url:find('/galleries$') then
+      sidCount = sidCount + 1
+      local body = json.decode(req.body)
+      createdTitles[#createdTitles + 1] = body.title
+      return 201, { ok = true, sid = 'SIDSPLIT' .. sidCount, tenant_id = 'abc123',
+        path = '/t/abc123/s/SIDSPLIT' .. sidCount, expires_at = iso(7) }
+    end
+    if req.method == 'PUT' then return 200, { ok = true } end
+    return 404, { ok = false, code = 'not_found', error = 'not found' }
+  end
+
+  -- capture the settings dialog's split notice and the result dialog's combined invitation
+  local realPresentSplit = modules.LrDialogs.presentModalDialog
+  local splitNoticeSeen, resultProps
+  modules.LrDialogs.presentModalDialog = function(args)
+    if args.actionVerb == '作成して送信' and args.actionBinding then
+      splitNoticeSeen = args.actionBinding.enabled.bind_to_object.splitLine
+    elseif args.actionVerb and args.actionVerb:find('閉じる', 1, true) then
+      resultProps = args.actionBinding.enabled.bind_to_object
+    end
+    return realPresentSplit(args)
+  end
+  run('CreateGallery.lua')
+  modules.LrDialogs.presentModalDialog = realPresentSplit
+
+  check(sidCount == 2, 'split: two galleries created at the time-group boundary (800/100)')
+  check(splitNoticeSeen == '900 枚を 2 つのギャラリーに分けて送ります（800枚・100枚）',
+    'split: the one-line notice before creating (' .. tostring(splitNoticeSeen) .. ')')
+  check(createdTitles[1] and createdTitles[1]:find('（1/2）', 1, true) ~= nil
+    and createdTitles[2] and createdTitles[2]:find('（2/2）', 1, true) ~= nil,
+    'split: titles carry the (1/2) / (2/2) suffix')
+
+  check(resultProps ~= nil, 'split: the result dialog was shown')
+  if resultProps then
+    check(resultProps.guidance:find('1/2：', 1, true) ~= nil and resultProps.guidance:find('2/2：', 1, true) ~= nil,
+      'split: the invitation lists both URLs, numbered')
+    check(resultProps.guidance:find('/s/SIDSPLIT1/', 1, true) ~= nil
+      and resultProps.guidance:find('/s/SIDSPLIT2/', 1, true) ~= nil,
+      'split: the invitation carries both galleries\' own URLs')
+  end
+
+  local recent = env.passwords.recentGalleries and json.decode(env.passwords.recentGalleries) or {}
+  check(#recent == 2, 'split: two entries in "最近のギャラリー" (' .. #recent .. ')')
+
+  -- the manifest: group numbers restart at 1 for the second gallery (not continuing from the
+  -- first's own count), 0 only where the source grouping itself had none (never here: every
+  -- photo above is dated)
+  local bySid = {}
+  for _, r in ipairs(env.requests) do
+    if r.method == 'PUT' and r.url:find('manifest%.json$') then
+      local sid = r.url:match('/galleries/([^/]+)/')
+      bySid[sid] = bySid[sid] or {}
+      local body = json.decode(r.body)
+      for _, p in ipairs(body.photos or {}) do bySid[sid][p.stem] = p.group end
+    end
+  end
+  local g1 = bySid.SIDSPLIT1 or {}
+  local g2 = bySid.SIDSPLIT2 or {}
+  check(g1.s0001 == 1, 'split: first gallery, first photo is group 1 (' .. tostring(g1.s0001) .. ')')
+  check(g2.s0801 == 1, 'split: second gallery, its own first photo restarts at group 1 (' .. tostring(g2.s0801) .. ')')
+  check((g1.s0001 or 0) > 0 and (g2.s0801 or 0) > 0, 'split: neither gallery sent group 0 (every photo is dated)')
+end
+
+-- ---------------------------------------------------------------------------
+-- Auto-split, partial failure (audit 15 §3.1): the 2nd gallery's own creation fails after the
+-- 1st already succeeded. The 1st must not be left behind — empty, in a resume job, in "最近の
+-- ギャラリー", or (課金 ON) holding its reserved base unit. 1000 undated photos -> {888, 112}
+-- (the same fixed-888 fallback already covered above; the point here is the failure, not the
+-- cut point).
+-- ---------------------------------------------------------------------------
+do
+  env.passwords.recentGalleries = nil
+  env.prefs = { locationPromptShown = true }
+  activeCatalog = newCatalog(manyPhotos(1000))
+
+  local posts, deletes = 0, {}
+  env.server = function(req)
+    if req.method == 'POST' and req.url:find('/galleries$') then
+      posts = posts + 1
+      if posts == 1 then
+        return 201, { ok = true, sid = 'SIDOK1', tenant_id = 'abc123', path = '/t/abc123/s/SIDOK1', expires_at = iso(7) }
+      end
+      return 402, { ok = false, code = 'card_required', error = 'card required' }
+    end
+    if req.method == 'DELETE' and req.url:find('/galleries/') then
+      deletes[#deletes + 1] = req.url
+      return 200, { ok = true }
+    end
+    if req.method == 'PUT' then return 200, { ok = true } end
+    return 200, { ok = true, galleries = {} }
+  end
+  run('CreateGallery.lua')
+
+  check(posts == 2, 'split failure: both creations were attempted (1st ok, 2nd failed)')
+  check(#deletes == 1 and deletes[1]:find('SIDOK1', 1, true) ~= nil,
+    'split failure: the 1st (already-created) gallery was deleted, not the 2nd (never created)')
+  local manifestSent = false
+  for _, r in ipairs(env.requests) do
+    if r.method == 'PUT' and r.url:find('manifest%.json$') then manifestSent = true end
+  end
+  check(not manifestSent, 'split failure: no photo was ever sent for either gallery')
+  local recent = env.passwords.recentGalleries and json.decode(env.passwords.recentGalleries) or {}
+  check(#recent == 0, 'split failure: the 1st gallery was removed from "最近のギャラリー" again (' .. #recent .. ' left)')
+  -- card_required routes through ui.showApiError's "confirm" (dashboard shortcut), not .message
+  check(lastDialog('confirm') ~= nil, 'split failure: a dialog about the failed creation was shown')
+  check(lastDialog('message') == nil or lastDialog('message').title ~= '作成済みのギャラリーが残っています',
+    'split failure: cleanup succeeded silently (no "残っています" dialog)')
+end
+
+-- Auto-split, partial failure where the cleanup DELETE also fails: the photographer is told,
+-- by title, instead of silently leaving an orphaned gallery with no explanation at all.
+do
+  env.passwords.recentGalleries = nil
+  env.prefs = { locationPromptShown = true }
+  activeCatalog = newCatalog(manyPhotos(1000))
+
+  local posts = 0
+  env.server = function(req)
+    if req.method == 'POST' and req.url:find('/galleries$') then
+      posts = posts + 1
+      if posts == 1 then
+        return 201, { ok = true, sid = 'SIDSTUCK', tenant_id = 'abc123', path = '/t/abc123/s/SIDSTUCK', expires_at = iso(7) }
+      end
+      return 402, { ok = false, code = 'card_required', error = 'card required' }
+    end
+    if req.method == 'DELETE' then return 500, { ok = false, error = 'server error' } end
+    if req.method == 'PUT' then return 200, { ok = true } end
+    return 200, { ok = true, galleries = {} }
+  end
+  env.dialogs = {}
+  run('CreateGallery.lua')
+
+  local stuck
+  for _, d in ipairs(env.dialogs) do
+    if d.title == '作成済みのギャラリーが残っています' then stuck = d end
+  end
+  check(stuck ~= nil, 'split failure: cleanup itself failing is reported')
+  check(stuck and stuck.info:find('ダッシュボード', 1, true) ~= nil, 'split failure: … and says to use the dashboard')
+  check(stuck and stuck.info:find('（1/2）', 1, true) ~= nil, 'split failure: … naming the stuck gallery by its own (1/2) title')
+end
+
 -- Dialog layout (1.0.3): no fixed-height text box is shorter than its text, and the bound ones
 -- (status / note of the result window) hold the longest messages the plug-in produces.
 check(layoutChecked >= 12, 'layout: static texts checked (' .. layoutChecked .. ')')
@@ -1794,6 +2727,245 @@ do
   }, '\n')
   check(layoutText.wrappedLines(note, 560) <= guidanceLib.NOTE_LINES,
     'layout: note box holds the longest note (' .. layoutText.wrappedLines(note, 560) .. ')')
+end
+
+-- ---------------------------------------------------------------------------
+-- Similarity (1.2.0): lib/similarity.lua drives the bundled helper
+-- (papat.lrplugin/bin/papat-fprint; env.fakeFprint stands in for it, same approach as
+-- env.fakeSips for the small-version shrinker). No real binary is built for this test; the
+-- repository never ships one. similarityLib.binaryPath is swapped for a file this test creates.
+-- ---------------------------------------------------------------------------
+do
+  local similarityLib = dofile(_PLUGIN.path .. '/lib/similarity.lua')
+  local groupingLib = dofile(_PLUGIN.path .. '/lib/grouping.lua')
+  local fakeBin = tmpRoot .. '/fake-papat-fprint'
+  os.execute('touch "' .. fakeBin .. '" && chmod +x "' .. fakeBin .. '"')
+  similarityLib.binaryPath = function() return fakeBin end
+  env.fprintMode = 'passthrough'
+  env.fprintCalls = 0
+
+  local function photoAt(path, wallTime)
+    local p = newPhoto(path)
+    p.raw.dateTimeISO8601 = wallTime
+    return p
+  end
+
+  -- two clusters, 3 photos each, a long gap between them: grouping.autoGroups should find 2
+  local items = {
+    { photo = photoAt('/p/a1.NEF', '2026-10-01T09:00:00'), sourceId = 'a1', datetime = '2026-10-01T09:00:00' },
+    { photo = photoAt('/p/a2.NEF', '2026-10-01T09:00:05'), sourceId = 'a2', datetime = '2026-10-01T09:00:05' },
+    { photo = photoAt('/p/a3.NEF', '2026-10-01T09:00:10'), sourceId = 'a3', datetime = '2026-10-01T09:00:10' },
+    { photo = photoAt('/p/b1.NEF', '2026-10-01T09:20:00'), sourceId = 'b1', datetime = '2026-10-01T09:20:00' },
+    { photo = photoAt('/p/b2.NEF', '2026-10-01T09:20:05'), sourceId = 'b2', datetime = '2026-10-01T09:20:05' },
+    { photo = photoAt('/p/b3.NEF', '2026-10-01T09:20:10'), sourceId = 'b3', datetime = '2026-10-01T09:20:10' },
+  }
+  local expected = groupingLib.autoGroups({
+    '2026-10-01T09:00:00', '2026-10-01T09:00:05', '2026-10-01T09:00:10',
+    '2026-10-01T09:20:00', '2026-10-01T09:20:05', '2026-10-01T09:20:10',
+  })
+  check(expected.count == 2, 'similarity test fixture: 2 time groups (sanity)')
+
+  -- not macOS: never even looks for the binary
+  do
+    WIN_ENV = true
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow)
+    check(ran == false and groupsNow._done == true and next(groupsNow, '_done') == nil,
+      'similarity: WIN_ENV skips entirely')
+    WIN_ENV = false
+  end
+
+  -- the binary is not where it is expected
+  do
+    local saved = similarityLib.binaryPath
+    similarityLib.binaryPath = function() return tmpRoot .. '/does-not-exist' end
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow)
+    check(ran == false and groupsNow._done == true, 'similarity: missing binary skips, does not fail the caller')
+    similarityLib.binaryPath = saved
+  end
+
+  -- too few photos: never calls the helper
+  do
+    env.fprintCalls = 0
+    local groupsNow = {}
+    local ran = similarityLib.compute({ items[1] }, groupsNow)
+    check(ran == false and groupsNow._done == true and env.fprintCalls == 0,
+      'similarity: fewer than 2 photos, nothing to refine, helper not called')
+  end
+
+  -- success (passthrough): groupsNow gets exactly lib/grouping.lua's own answer
+  do
+    env.fprintMode = 'passthrough'
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow)
+    check(ran == true and groupsNow._done == true, 'similarity: passthrough succeeds')
+    local ok = true
+    for i, item in ipairs(items) do
+      if groupsNow[item.sourceId] ~= expected.groups[i] then ok = false end
+    end
+    check(ok, 'similarity: passthrough matches lib/grouping.lua exactly')
+  end
+
+  -- the helper actually refines: a custom answer comes back untouched
+  do
+    env.fprintMode = 'refine'
+    env.fprintGroups = { 1, 1, 2, 3, 3, 3 } -- splits cluster A, keeps B as one group
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow)
+    check(ran == true, 'similarity: refine succeeds')
+    local wantBySource = { a1 = 1, a2 = 1, a3 = 2, b1 = 3, b2 = 3, b3 = 3 }
+    local ok = true
+    for sourceId, want in pairs(wantBySource) do
+      if groupsNow[sourceId] ~= want then ok = false end
+    end
+    check(ok, 'similarity: refine is passed through to groupsNow untouched')
+  end
+
+  -- the helper fails outright: no groups, caller is never told
+  do
+    env.fprintMode = 'fail'
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow)
+    check(ran == false and groupsNow._done == true and next(groupsNow, '_done') == nil,
+      'similarity: helper exit 1 -> no groups')
+  end
+
+  -- the helper's answer cannot be read: same as failing outright
+  do
+    env.fprintMode = 'garbage'
+    local groupsNow = {}
+    check(similarityLib.compute(items, groupsNow) == false, 'similarity: unreadable JSON -> no groups')
+    env.fprintMode = 'wronglen'
+    groupsNow = {}
+    check(similarityLib.compute(items, groupsNow) == false, 'similarity: wrong-length answer -> no groups')
+  end
+
+  -- a photo whose preview could not be made: excluded from the window average (no feature
+  -- print to average), but keeps its time-based group rather than being forced to 0 — one bad
+  -- preview must not make the gallery discard every other photo's group too (必須, audit 15 §5.3)
+  do
+    env.fprintMode = 'passthrough'
+    local withOneBad = {}
+    for i, item in ipairs(items) do withOneBad[i] = item end
+    withOneBad[2].photo.noThumb = true -- a2's preview fails
+    local groupsNow = {}
+    local ran = similarityLib.compute(withOneBad, groupsNow)
+    check(ran == true, 'similarity: one bad preview out of six still runs')
+    check(groupsNow.a2 ~= nil and groupsNow.a2 == groupsNow.a1,
+      'similarity: the photo with no preview still gets its time-based group, not 0 (' .. tostring(groupsNow.a2) .. ')')
+    check(groupsNow.a1 ~= nil and groupsNow.b1 ~= nil, 'similarity: the rest are unaffected')
+    withOneBad[2].photo.noThumb = false
+  end
+
+  -- too many bad previews: skipped outright rather than refining from a thin sample
+  do
+    env.fprintMode = 'passthrough'
+    local mostlyBad = {}
+    for i, item in ipairs(items) do mostlyBad[i] = item end
+    for i = 1, 5 do mostlyBad[i].photo.noThumb = true end -- only 1 of 6 previews usable
+    local groupsNow = {}
+    env.fprintCalls = 0
+    local ran = similarityLib.compute(mostlyBad, groupsNow)
+    check(ran == false and env.fprintCalls == 0, 'similarity: too few usable previews, helper not even called')
+    for i = 1, 5 do mostlyBad[i].photo.noThumb = false end
+  end
+
+  -- a time budget and a cancel button (audit 15 §5.2): the auto-split's one synchronous,
+  -- unavoidable wait must not run unbounded or be stuck with no way out
+  do
+    env.fprintMode = 'passthrough'
+
+    -- already past the deadline before starting: gives up immediately, never calls the helper
+    env.fprintCalls = 0
+    local groupsNow = {}
+    local ran = similarityLib.compute(items, groupsNow, { deadlineEpoch = os.time() - 1 })
+    check(ran == false and groupsNow._done == true and env.fprintCalls == 0,
+      'similarity: a deadline already in the past skips entirely')
+
+    -- already canceled before starting: same
+    env.fprintCalls = 0
+    groupsNow = {}
+    ran = similarityLib.compute(items, groupsNow, { isCanceled = function() return true end })
+    check(ran == false and env.fprintCalls == 0, 'similarity: canceled before starting skips entirely')
+
+    -- canceled partway through rendering previews: the rest are left without one, and (since
+    -- the cancel flag stays set) the helper is never called even if enough were still usable
+    env.fprintCalls = 0
+    local calls = 0
+    groupsNow = {}
+    ran = similarityLib.compute(items, groupsNow, {
+      isCanceled = function() calls = calls + 1; return calls > 2 end,
+    })
+    check(ran == false and env.fprintCalls == 0,
+      'similarity: canceled partway through rendering previews, helper still not called')
+
+    -- a deadline far in the future does not interfere with an otherwise normal run
+    env.fprintCalls = 0
+    groupsNow = {}
+    ran = similarityLib.compute(items, groupsNow, { deadlineEpoch = os.time() + 3600, isCanceled = function() return false end })
+    check(ran == true and env.fprintCalls == 1, 'similarity: a deadline that has not passed does not block a normal run')
+  end
+
+  env.fprintMode = 'passthrough'
+end
+
+-- ---------------------------------------------------------------------------
+-- Similarity groups end to end (1.2.0): CreateGallery.lua -> lib/similarity.lua ->
+-- lib/pipeline.lua -> the manifest. CreateGallery.lua loads its own copy of lib/similarity.lua
+-- (every module here is a fresh dofile, not a singleton — see lib/*.lua's `local function load`),
+-- so it cannot be handed the monkey-patched instance above: the fake helper is placed at the
+-- real path instead (papat.lrplugin/bin/, which the repository otherwise never populates —
+-- scripts/build-pkg.sh only ever builds one into a temp payload copy; .gitignore excludes it).
+-- The fake helper resolves synchronously here (there is no real subprocess to wait for), so
+-- this exercises the normal path, not the late-pass timing; lib/pipeline.lua's groupsNow
+-- handling itself reuses the already-tested thumb late-pass code (same function, same tests).
+-- ---------------------------------------------------------------------------
+do
+  local binDir = _PLUGIN.path .. '/bin'
+  os.execute('mkdir -p "' .. binDir .. '" && touch "' .. binDir .. '/papat-fprint" && chmod +x "'
+    .. binDir .. '/papat-fprint"')
+
+  local function photoAt(path, wallTime)
+    local p = newPhoto(path)
+    p.raw.dateTimeISO8601 = wallTime
+    return p
+  end
+  -- already in chronological order, so manifest order == selection order (no surprises)
+  local photosList = {
+    photoAt('/p/g1.NEF', '2026-10-01T09:00:00'),
+    photoAt('/p/g2.NEF', '2026-10-01T09:00:05'),
+    photoAt('/p/g3.NEF', '2026-10-01T09:20:00'),
+    photoAt('/p/g4.NEF', '2026-10-01T09:20:05'),
+  }
+  activeCatalog = newCatalog(photosList)
+  env.fprintMode = 'refine'
+  env.fprintGroups = { 1, 1, 2, 2 }
+  env.server = function(req)
+    if req.method == 'POST' and req.url:find('/galleries$') then
+      return 201, { ok = true, sid = 'SIDSIM', tenant_id = 'abc123', path = '/t/abc123/s/SIDSIM', expires_at = iso(7) }
+    end
+    if req.method == 'PUT' then return 200, { ok = true } end
+    return 404, { ok = false, code = 'not_found', error = 'not found' }
+  end
+  run('CreateGallery.lua')
+
+  -- each manifest PUT carries only the photos that became ready since the last one (the server
+  -- merges by stem/source_id, lib/pipeline.lua's own top comment); so every request is folded
+  -- together here, later ones winning, the same way the server's own merge behaves.
+  local manifestCount, byStem = 0, {}
+  for _, r in ipairs(env.requests) do
+    if r.method == 'PUT' and r.url:find('manifest%.json$') then
+      manifestCount = manifestCount + 1
+      local body = json.decode(r.body)
+      for _, p in ipairs(body.photos or {}) do byStem[p.stem] = p.group end
+    end
+  end
+  check(manifestCount > 0, 'similarity e2e: a manifest was sent')
+  check(byStem.g1 == 1 and byStem.g2 == 1 and byStem.g3 == 2 and byStem.g4 == 2,
+    'similarity e2e: the helper\'s groups reach the manifest (' .. json.encode(byStem) .. ')')
+
+  os.execute('rm -rf "' .. binDir .. '"')
 end
 
 print(string.format('%d smoke checks, %d failed', total, failed))

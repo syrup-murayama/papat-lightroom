@@ -62,6 +62,8 @@ local function currentInfo(apiKey)
     required = client.update_required == true,
     -- the remaining free galleries ride along (shown in the create dialog; never hard-coded)
     freeRemaining = text.parseFreeRemaining(res.data.free_galleries_remaining),
+    -- the most photos a gallery may hold: the create command checks against it
+    maxPhotos = text.parseMaxPhotos(res.data.max_photos),
   }
   saveCache(info)
   return info
@@ -72,6 +74,13 @@ end
 function M.freeRemaining()
   local cached = loadCache()
   return cached and text.parseFreeRemaining(cached.freeRemaining) or nil
+end
+
+--- The most photos one gallery may hold, as the server last said (status call, cached), or the
+--- plug-in's own assumption (text.MAX_PHOTOS) when it did not say. Reads the cache: no request.
+function M.maxPhotos()
+  local cached = loadCache()
+  return (cached and text.parseMaxPhotos(cached.maxPhotos)) or text.MAX_PHOTOS
 end
 
 --- Remember the number from a create response (nil is ignored).

@@ -44,6 +44,21 @@ papat for Lightroom Classic の `.pkg`（ダブルクリックで入るインス
 
 ---
 
+## ①b Developer ID Application 証明書を用意する（papat-fprint を署名するとき。1.2.0〜）
+
+1.2.0 からは、`papat.lrplugin/bin/papat-fprint`（似ている写真を調べる、同梱の小さな実行ファイル。Mac のみ、通信しない）も
+署名します。**①の Developer ID Installer とは別の種類**（`.pkg` 全体の署名／1 本の実行ファイルの署名、という違い）。
+**公証する（③ で `PAPAT_NOTARY_PROFILE` を付ける）なら、この証明書と `PAPAT_APP_IDENTITY` は必須**です。Apple の公証は、
+署名の無い（または hardened runtime の無い）実行ファイルが .pkg の中にあると、それだけで拒否します。省略できるのは、
+公証も配布もしない、手元の確認用ビルド（`scripts/build-pkg.sh` を何も指定せず実行）だけです。
+
+1. ①の「方法A」「方法B」と同じ手順で、**Developer ID Installer** の代わりに **Developer ID Application** を選んで作る
+2. キーチェーンアクセスで `Developer ID Application: Your Name (XXXXXXXXXX)` を確認する
+   （`security find-identity -v | grep "Developer ID Application"`）
+3. この名前を、③ の `PAPAT_APP_IDENTITY` に使う
+
+---
+
 ## ② 公証用の資格情報をキーチェーンに保存する（初回だけ）
 
 Apple の公証サービスにログインするための情報を、`notarytool` の「プロファイル」としてキーチェーンに保存します。
@@ -81,10 +96,14 @@ Apple の公証サービスにログインするための情報を、`notarytool
    ```
 
 2. （任意）テストを通す: `scripts/check.sh`
-3. 次を実行する。`PAPAT_INSTALLER_IDENTITY` には ① でメモした証明書の名前を、そのまま入れます
+3. 次を実行する。`PAPAT_INSTALLER_IDENTITY` には ① でメモした証明書の名前を、そのまま入れます。
+   `PAPAT_APP_IDENTITY`（①b の証明書）は、**公証する（`PAPAT_NOTARY_PROFILE` を付ける）ならここでは必須**です
+   （Apple の公証は、未署名の実行ファイルが .pkg の中にあると受け付けません）。省略できるのは、公証しない・配布しない
+   確認用のビルドだけです
 
    ```sh
    PAPAT_INSTALLER_IDENTITY="Developer ID Installer: Your Name (XXXXXXXXXX)" \
+   PAPAT_APP_IDENTITY="Developer ID Application: Your Name (XXXXXXXXXX)" \
    PAPAT_NOTARY_PROFILE="papat-notary" \
    scripts/build-pkg.sh
    ```
@@ -93,7 +112,9 @@ Apple の公証サービスにログインするための情報を、`notarytool
 
    | 表示 | 意味 |
    |---|---|
-   | `== signing` | 署名中。キーチェーンのアクセス許可を聞かれたら「常に許可」を選ぶ |
+   | `== signing the similarity helper` | papat-fprint の署名中（③ の手順どおりなら必ず出る） |
+   | `error: PAPAT_NOTARY_PROFILE is set but PAPAT_APP_IDENTITY is not …` | `PAPAT_APP_IDENTITY` を付け忘れている。③ の手順どおりに付けてやり直す |
+   | `== signing` | .pkg 自体の署名中。キーチェーンのアクセス許可を聞かれたら「常に許可」を選ぶ |
    | `== notarizing` | Apple に送信して結果待ち（通常 2〜10分） |
    | `submission: … status: Accepted` | 公証 OK |
    | `== stapling` | 公証のチケットを .pkg に添付 |

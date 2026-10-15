@@ -34,9 +34,17 @@ VERSION="$(sed -n 's/.*VERSION = { major = \([0-9]*\), minor = \([0-9]*\), revis
 
 IDENTITY="${PAPAT_INSTALLER_IDENTITY:-}"
 PROFILE="${PAPAT_NOTARY_PROFILE:-}"
+APP_IDENTITY="${PAPAT_APP_IDENTITY:-}"
 
 if [ -n "$PROFILE" ] && [ -z "$IDENTITY" ]; then
   die "PAPAT_NOTARY_PROFILE is set but PAPAT_INSTALLER_IDENTITY is not (notarization needs a signed package)"
+fi
+# Apple's notary service refuses a package that contains an unsigned Mach-O executable (or one
+# without the hardened runtime): "The binary is not signed with a valid Developer ID
+# certificate" / "does not have the hardened runtime enabled". papat-fprint is such a binary,
+# so once notarization is requested, signing it is no longer optional (docs/guide-signing.md §1b).
+if [ -n "$PROFILE" ] && [ -z "$APP_IDENTITY" ]; then
+  die "PAPAT_NOTARY_PROFILE is set but PAPAT_APP_IDENTITY is not — notarization rejects an unsigned papat-fprint (docs/guide-signing.md §1b)"
 fi
 
 OUT="dist"
@@ -55,7 +63,34 @@ find "$PAYLOAD" -name '.DS_Store' -delete
 find "$PAYLOAD" -type d -exec chmod 755 {} +
 find "$PAYLOAD" -type f -exec chmod 644 {} +
 
-UNEXPECTED="$(find "$PAYLOAD/papat.lrplugin" -type f ! -name '*.lua' ! -name LICENSE)"
+# 1b. The similarity helper (Vision feature prints; macOS only, no networking — see
+#     tools/papat-fprint/main.swift). Built fresh every time (universal: Apple silicon + Intel,
+#     whichever Mac runs this script); never checked into the repo and never present in
+#     papat.lrplugin/ outside this payload copy.
+command -v xcrun >/dev/null 2>&1 || die "xcrun not found (install the Xcode command line tools)"
+command -v lipo >/dev/null 2>&1 || die "lipo not found (install the Xcode command line tools)"
+FPRINT_SRC="tools/papat-fprint/main.swift"
+[ -f "$FPRINT_SRC" ] || die "$FPRINT_SRC not found"
+FPRINT_BIN="$PAYLOAD/papat.lrplugin/bin/papat-fprint"
+mkdir -p "$(dirname "$FPRINT_BIN")"
+xcrun swiftc -O -target arm64-apple-macosx11.0 -o "$WORK/papat-fprint-arm64" "$FPRINT_SRC"
+xcrun swiftc -O -target x86_64-apple-macosx10.15 -o "$WORK/papat-fprint-x86_64" "$FPRINT_SRC"
+lipo -create -output "$FPRINT_BIN" "$WORK/papat-fprint-arm64" "$WORK/papat-fprint-x86_64"
+chmod 755 "$FPRINT_BIN"
+
+# Signing (Developer ID Application, hardened runtime): a *different* certificate type than
+# the outer .pkg's own (PAPAT_INSTALLER_IDENTITY). Required once PAPAT_NOTARY_PROFILE is set
+# (checked above); otherwise optional — without it, this binary ships unsigned, fine for local
+# inspection. The plug-in's own fallback (no `group` sent) is the same either way (lib/similarity.lua).
+if [ -n "$APP_IDENTITY" ]; then
+  echo "== signing the similarity helper"
+  codesign --force --options runtime --timestamp --sign "$APP_IDENTITY" "$FPRINT_BIN"
+  codesign --verify --strict "$FPRINT_BIN"
+else
+  echo "note: PAPAT_APP_IDENTITY not set; papat-fprint ships unsigned this time (docs/guide-signing.md)" >&2
+fi
+
+UNEXPECTED="$(find "$PAYLOAD/papat.lrplugin" -type f ! -name '*.lua' ! -name LICENSE ! -name papat-fprint)"
 if [ -n "$UNEXPECTED" ]; then
   echo "unexpected files in the plug-in folder:" >&2
   echo "$UNEXPECTED" >&2

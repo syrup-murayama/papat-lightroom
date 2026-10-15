@@ -27,6 +27,7 @@ local api = load('api')
 local export = load('export')
 local preview = load('preview')
 local jpeg = load('jpeg')
+local thumbLib = load('thumb')
 local icc = load('icc')
 local rights = load('rights')
 local catalogLib = load('catalog')
@@ -52,6 +53,21 @@ local TROUBLE_LOWER = 2       -- this many troubled uploads in a row: one upload
 local CLEAN_RECOVER = 5       -- this many clean uploads in a row: back to the full parallelism
 local BUSY_STOP = 6           -- this many photos failed in a row (after retries): pause the send
 local MAX_QUEUE = 12       -- rendered but not yet sent: bounds memory / temp space
+-- The server allows 300 PUTs a minute per account (photos and manifests count). Requests are
+-- started at most this often (about 270 a minute). The small versions are not counted by the
+-- server any more: they follow their photo at once. A server that still counts them (an older
+-- deployment) answers 429; from the first 429 on, the small versions keep the same interval.
+local PACE = 0.22
+local THUMB_GIVE_UP = 3       -- this many small versions in a row refused / failed: stop making them
+local THUMB_BATCH = 20        -- files per sips call (about 20 ms a file in a batch, 75 ms one by one)
+local THUMB_BATCH_MIN = 10    -- wait for this many (or for THUMB_BATCH_WAIT seconds) before a sips call
+local THUMB_BATCH_WAIT = 1.5
+local THUMB_QUEUE_MAX = 60    -- photos waiting for sips: more than this and the photo workers wait
+local THUMB_PUTTERS = 2       -- small versions are sent by their own tasks, not by the photo workers
+local THUMB_TAIL_LIMIT = 120  -- seconds the end of a send waits for the small versions
+local GROUPS_TAIL_LIMIT = 30  -- seconds the end of a send waits for the similarity groups
+                               -- (in practice they are ready long before this: a 300-photo send
+                               -- spends minutes uploading, the helper binary a few seconds)
 
 -- Failures that make sending the remaining photos pointless.
 local FATAL_CODES = {
@@ -127,6 +143,24 @@ local function addBack(clean, report, srcItem)
   return clean, report
 end
 
+--- The gallery's own order: capture time, then file name, then the selection order
+--- (text.photoOrderLess) — sets .order / .datetime / .sortName on each item (in place) and
+--- returns a new array sorted by them. M.run calls this itself; lib/similarity.lua and the
+--- auto-split in CreateGallery.lua call it first, so all three agree on the same order without
+--- repeating the rule. Pure bookkeeping (no yielding), but still only meant for an async task
+--- (same as everything else here, for consistency).
+function M.order(items)
+  local ordered = {}
+  for i, item in ipairs(items) do
+    item.order = i
+    item.datetime = item.datetime or ''
+    item.sortName = text.nameKey(LrPathUtils.leafName(tostring(item.photo:getRawMetadata('path') or '')))
+    ordered[i] = item
+  end
+  table.sort(ordered, text.photoOrderLess)
+  return ordered
+end
+
 --- @param o table
 ---   apiKey, sid, title, keyColor ('' = none), catalog
 ---   items        array of { photo, sourceId }
@@ -136,23 +170,24 @@ end
 ---   isCanceled() -> boolean
 ---   onStatus(s)  s = { rendered, uploaded, total, failed, phase }
 ---   askRetry(count, example) -> boolean      (optional)
+---   groupsNow    table|nil  [sourceId] = similarity group (1-based), filled in by the caller's
+---                own background task (lib/similarity.lua) as it goes, while this is sending.
+---                A photo not yet uploaded when its group becomes known just picks it up here
+---                (uploadItem reads this table fresh each time); photos already sent are patched
+---                by one extra manifest pass near the end (bounded wait: GROUPS_TAIL_LIMIT) —
+---                the same approach as the thumb late pass below, and for the same reason (the
+---                photos' own manifest entries must never be rebuilt from outside this file).
+---                `groupsNow._done` true marks it finished (whether or not it found anything).
 --- @return table result
 ---   { uploaded, usedNames, failedUpload, failedRender, canceled, fatal, manifestError,
 ---     timings = { total, render, upload, renderPerPhoto, uploadPerPhoto, concurrency, fast } }
 function M.run(o)
   local concurrency = math.max(1, math.min(o.concurrency or M.DEFAULT_CONCURRENCY, 4))
 
-  -- The order of the gallery is decided here, once: capture time, then file name, then the
-  -- selection order (text.photoOrderLess). Rendering and uploading follow it, and manifests are
-  -- published as a prefix of it, so the order never depends on which upload finishes first.
-  local ordered = {}
-  for i, item in ipairs(o.items) do
-    item.order = i
-    item.datetime = item.datetime or ''
-    item.sortName = text.nameKey(LrPathUtils.leafName(tostring(item.photo:getRawMetadata('path') or '')))
-    ordered[i] = item
-  end
-  table.sort(ordered, text.photoOrderLess)
+  -- The order of the gallery is decided here, once (M.order; see its own comment). Rendering
+  -- and uploading follow it, and manifests are published as a prefix of it, so the order never
+  -- depends on which upload finishes first.
+  local ordered = M.order(o.items)
   for rank, item in ipairs(ordered) do item.rank = rank end
   o.items = ordered
   local total = #o.items
@@ -171,6 +206,13 @@ function M.run(o)
     retries = 0, busyStop = false, failedStatus = {},
     longMin = nil, longMax = nil, sentBytes = 0, sentCount = 0,
     removed = {}, strippedBytes = 0,
+    thumbs = o.thumbs ~= false, thumbSent = 0, thumbFailed = 0, thumbSkipped = 0, thumbBytes = 0,
+    thumbStreak = 0, thumbWhy = {}, nextSlot = 0, thumbPaced = false,
+    -- small versions: their size and where the time goes
+    thumbLongMin = nil, thumbLongMax = nil,
+    thumbQ = {}, thumbPutQ = {}, thumbsClosed = false, thumbMakerDone = false, thumbRunning = 0,
+    sipsSeconds = 0, sipsCalls = 0, sipsFiles = 0, thumbPutSeconds = 0, thumbPutCalls = 0,
+    sentEntries = {}, thumbPublished = {}, passSeconds = 0, passEntries = 0,
   }
   local used = {}
   for _, name in ipairs(o.usedNames or {}) do used[name:lower()] = true end
@@ -197,6 +239,14 @@ function M.run(o)
 
   local function stopped()
     return st.canceled or st.fatal ~= nil or st.busyStop
+  end
+
+  --- Wait for the next free slot before a request (see PACE).
+  local function pace()
+    local t = now()
+    local slot = math.max(st.nextSlot, t)
+    st.nextSlot = slot + PACE
+    if slot > t then LrTasks.sleep(slot - t) end
   end
 
   function checkCanceled()
@@ -229,6 +279,14 @@ function M.run(o)
     for label, n in pairs(report.removed) do st.removed[label] = (st.removed[label] or 0) + n end
   end
 
+  local function noteThumbSize(report)
+    local long = math.max(report.width or 0, report.height or 0)
+    if long > 0 then
+      st.thumbLongMin = st.thumbLongMin and math.min(st.thumbLongMin, long) or long
+      st.thumbLongMax = st.thumbLongMax and math.max(st.thumbLongMax, long) or long
+    end
+  end
+
   local function push(item)
     -- back-pressure: do not run far ahead of the uploads
     while (#st.queue - st.head + 1) >= MAX_QUEUE and not checkCanceled() do
@@ -243,7 +301,10 @@ function M.run(o)
   -- Manifest
   -- -------------------------------------------------------------------------
 
-  local function manifestBody(photos, complete)
+  --- opts.omitKeyColor: the server then uses the gallery's current color (what the photographer
+  --- may have changed in the browser while the photos were being sent) instead of the one this
+  --- send started with. Used by the late pass that only adds the small versions.
+  local function manifestBody(photos, complete, opts)
     local m = {
       version = 1,
       title = o.title,
@@ -254,7 +315,7 @@ function M.run(o)
       groupThreshold = 3,
       complete = complete,
     }
-    if o.keyColor and o.keyColor ~= '' then m.key_color = o.keyColor end
+    if o.keyColor and o.keyColor ~= '' and not (opts and opts.omitKeyColor) then m.key_color = o.keyColor end
     return m
   end
 
@@ -307,8 +368,15 @@ function M.run(o)
     if not force and n < need and (now() - st.lastFlush) < MAX_AGE then return true end
 
     st.flushing = true
+    pace()
     local entries = {}
-    for _, d in ipairs(batch) do entries[#entries + 1] = d.entry end
+    -- which of these already carry their small version in what is being sent: noted now, before
+    -- the request (it waits; a small version that arrives meanwhile is not in this body)
+    local carried = {}
+    for _, d in ipairs(batch) do
+      entries[#entries + 1] = d.entry
+      carried[d.entry] = (d.entry.thumb ~= nil)
+    end
     local res = api.putManifest(o.apiKey, o.sid, manifestBody(entries, complete == true))
     st.flushing = false
 
@@ -330,6 +398,7 @@ function M.run(o)
 
     local records = {}
     for _, d in ipairs(batch) do
+      st.thumbPublished[d.entry] = carried[d.entry] -- (kept outside the entry: it is sent as it is)
       d.item.src.done = true
       usedList[#usedList + 1] = d.filename
       records[#records + 1] = {
@@ -503,6 +572,139 @@ function M.run(o)
   -- Workers: PUT photos
   -- -------------------------------------------------------------------------
 
+  -- -------------------------------------------------------------------------
+  -- Small versions: a side channel, never on the photos' way
+  --   The JPEG that was sent (preview or export, cleaned) is shrunk by macOS sips in batches by
+  --   a separate task and PUT by their own tasks, after their photo; the manifest names them
+  --   (`thumb`) in a later pass, once they have arrived. A failure here never touches a photo.
+  --   (Lightroom's small previews are NOT used: after an edit they can stay old while the big
+  --   preview is already new - seen on a real machine, 2026-10-15.)
+  -- -------------------------------------------------------------------------
+
+  local function thumbFail(why)
+    st.thumbFailed = st.thumbFailed + 1
+    st.thumbWhy[why] = (st.thumbWhy[why] or 0) + 1
+    st.thumbStreak = st.thumbStreak + 1
+    if st.thumbStreak >= THUMB_GIVE_UP and st.thumbs then
+      st.thumbs = false
+      log.warn('small versions: %d failures in a row (%s); not making any more in this send',
+        st.thumbStreak, tostring(why))
+    end
+  end
+
+  --- What happens to a photo's small version once the photo is on the server.
+  local function handOffThumb(item, bytes, entry)
+    if not st.thumbs or stopped() then return end
+    local info = jpeg.parse(bytes)
+    if not info then return end
+    local long = thumbLib.targetLong(info.width, info.height)
+    if not long then
+      st.thumbSkipped = st.thumbSkipped + 1 -- already small: the big one is the small one
+      return
+    end
+    -- bounded, so it can never run away
+    while #st.thumbQ >= THUMB_QUEUE_MAX and st.thumbs and not stopped() do LrTasks.sleep(POLL) end
+    if not st.thumbs then return end
+    st.thumbQ[#st.thumbQ + 1] = { item = item, bytes = bytes, long = long, entry = entry, queuedAt = now() }
+  end
+
+  --- The next batch for sips: up to THUMB_BATCH photos that need the same long edge; waits for
+  --- THUMB_BATCH_MIN of them (or THUMB_BATCH_WAIT seconds, or the end of the send).
+  local function takeBatch()
+    local n = #st.thumbQ
+    if n == 0 then return nil end
+    if n < THUMB_BATCH_MIN and (now() - st.thumbQ[1].queuedAt) < THUMB_BATCH_WAIT and not st.thumbsClosed then
+      return nil
+    end
+    local long = st.thumbQ[1].long
+    local batch, rest = {}, {}
+    for _, entry in ipairs(st.thumbQ) do
+      if entry.long == long and #batch < THUMB_BATCH then batch[#batch + 1] = entry else rest[#rest + 1] = entry end
+    end
+    st.thumbQ = rest
+    return batch
+  end
+
+  local function makeBatch(batch)
+    local jobs = {}
+    for _, b in ipairs(batch) do jobs[#jobs + 1] = { tag = tostring(b.item.src.rank), bytes = b.bytes } end
+    local results, info = thumbLib.shrinkMany(jobs, st.dir, batch[1].long, now)
+    st.sipsSeconds = st.sipsSeconds + info.seconds
+    st.sipsCalls = st.sipsCalls + 1
+    st.sipsFiles = st.sipsFiles + #batch
+    for _, b in ipairs(batch) do
+      local small = results[tostring(b.item.src.rank)]
+      b.bytes = nil
+      if not small then
+        thumbFail(info.why or 'sips')
+      else
+        local clean, report = jpeg.sanitize(small)
+        if not clean then
+          thumbFail('unreadable')
+        elseif math.max(report.width, report.height) > thumbLib.MAX_LONG_EDGE then
+          thumbFail('long-edge')
+        else
+          clean, report = addBack(clean, report, b.item.src) -- copyright / contact + sRGB, as on the big one
+          if #clean > thumbLib.MAX_BYTES then
+            thumbFail('too-large')
+          else
+            noteThumbSize(report)
+            st.thumbPutQ[#st.thumbPutQ + 1] = { filename = b.item.filename, bytes = clean, entry = b.entry }
+          end
+        end
+      end
+    end
+  end
+
+  local function thumbMaker()
+    while true do
+      local batch = takeBatch()
+      if batch then
+        if st.thumbs and not stopped() then makeBatch(batch) end
+      elseif st.thumbsClosed and #st.thumbQ == 0 then
+        break
+      else
+        LrTasks.sleep(POLL)
+      end
+    end
+    st.thumbMakerDone = true
+    st.thumbRunning = st.thumbRunning - 1
+  end
+
+  local function thumbPutter()
+    while true do
+      local job = table.remove(st.thumbPutQ, 1)
+      if job then
+        if st.thumbs and not stopped() then
+          -- not counted by the server; paced only once the server has shown that it counts them
+          if st.thumbPaced then pace() end
+          local t = now()
+          local res = api.putThumb(o.apiKey, o.sid, job.filename, job.bytes)
+          st.thumbPutSeconds = st.thumbPutSeconds + (now() - t)
+          st.thumbPutCalls = st.thumbPutCalls + 1
+          if res.rateLimited and not st.thumbPaced then
+            st.thumbPaced = true
+            log.info('small versions: 429 seen; they keep the %.2fs interval from now on', PACE)
+          end
+          if res.ok then
+            st.thumbStreak = 0
+            st.thumbSent = st.thumbSent + 1
+            st.thumbBytes = st.thumbBytes + #job.bytes
+            job.entry.thumb = 'thumbs/' .. text.urlEncodeSegment(job.filename)
+          else
+            log.warn('small version refused: %s HTTP %s code=%s', job.filename, tostring(res.status), tostring(res.code))
+            thumbFail(res.network and 'network' or ('http-' .. tostring(res.status)))
+          end
+        end
+      elseif st.thumbsClosed and st.thumbMakerDone then
+        break
+      else
+        LrTasks.sleep(POLL)
+      end
+    end
+    st.thumbRunning = st.thumbRunning - 1
+  end
+
   local function uploadItem(item)
     local bytes = item.bytes or readBytes(item.path)
     if not bytes then
@@ -532,6 +734,7 @@ function M.run(o)
       item.sanitized = true
     end
 
+    pace()
     local t = now()
     local res = api.putPhoto(o.apiKey, o.sid, item.filename, bytes)
     st.uploadSeconds = st.uploadSeconds + (now() - t)
@@ -576,9 +779,11 @@ function M.run(o)
           keywords = {},
           datetime = item.src.datetime or '',
           camera = '',
-          group = 0,
+          group = (o.groupsNow and o.groupsNow[item.sourceId]) or 0,
         },
       }
+      st.sentEntries[#st.sentEntries + 1] = d.entry
+      handOffThumb(item, bytes, d.entry)
       if d.index < st.nextIndex then
         d.late = true
         st.late[#st.late + 1] = d
@@ -651,6 +856,12 @@ function M.run(o)
   -- -------------------------------------------------------------------------
 
   status('start')
+  -- The small versions have their own tasks: they run next to the photos, never inside a photo's way.
+  if st.thumbs then
+    st.thumbRunning = 1 + THUMB_PUTTERS
+    LrTasks.startAsyncTask(thumbMaker)
+    for _ = 1, THUMB_PUTTERS do LrTasks.startAsyncTask(thumbPutter) end
+  end
   local tasks = { produce }
   for k = 1, concurrency do tasks[#tasks + 1] = function() worker(k) end end
   local tUploadStart = now()
@@ -669,6 +880,10 @@ function M.run(o)
     runTasks(ws)
   end
 
+  -- No more photos: the small versions that are still under way are the only thing left.
+  local tPhotosDone = now()
+  st.thumbsClosed = true
+
   -- Final manifest (complete = true), retried on request.
   local finished = flush(true, true)
   while not finished and not st.fatal and o.askRetry do
@@ -677,7 +892,58 @@ function M.run(o)
     finished = flush(true, true)
   end
 
+  -- Wait (bounded, each on its own clock) for the small versions and the similarity groups,
+  -- then tell the gallery about whichever entries arrived after their photo's own manifest
+  -- went out: the same entries again, now with `thumb` and/or `group`.
+  do
+    local thumbGiveUpAt = now() + THUMB_TAIL_LIMIT
+    local groupsGiveUpAt = now() + GROUPS_TAIL_LIMIT
+    local groupsPending = o.groupsNow ~= nil and not o.groupsNow._done
+    while st.thumbRunning > 0 or groupsPending do
+      local t = now()
+      if st.thumbRunning > 0 and t > thumbGiveUpAt and st.thumbs then
+        st.thumbs = false
+        log.warn('small versions: not finished after %ds; the rest is left to the server', THUMB_TAIL_LIMIT)
+      end
+      if groupsPending and (t > groupsGiveUpAt or o.groupsNow._done) then
+        if t > groupsGiveUpAt and not o.groupsNow._done then
+          log.warn('similarity groups: not finished after %ds; already-sent photos keep their time-based group',
+            GROUPS_TAIL_LIMIT)
+        end
+        groupsPending = false
+      end
+      if st.thumbRunning > 0 or groupsPending then LrTasks.sleep(POLL) end
+    end
+  end
+  st.thumbTail = now() - tPhotosDone
+  if finished and not stopped() then
+    local pending = {}
+    for _, entry in ipairs(st.sentEntries) do
+      local needsThumb = entry.thumb and not st.thumbPublished[entry]
+      local newGroup = o.groupsNow and entry.group == 0 and o.groupsNow[entry.source_id]
+      if newGroup then entry.group = newGroup end
+      if needsThumb or newGroup then pending[#pending + 1] = entry end
+    end
+    local tPass = now()
+    local i = 1
+    while i <= #pending do
+      local chunk = {}
+      for k = i, math.min(i + 99, #pending) do chunk[#chunk + 1] = pending[k] end
+      pace()
+      local res = api.putManifest(o.apiKey, o.sid, manifestBody(chunk, true, { omitKeyColor = true }))
+      if not res.ok then
+        log.warn('late manifest pass (thumb/group) refused: HTTP %s code=%s', tostring(res.status), tostring(res.code))
+        break
+      end
+      for _, entry in ipairs(chunk) do st.thumbPublished[entry] = true end
+      st.passEntries = st.passEntries + #chunk
+      i = i + 100
+    end
+    st.passSeconds = now() - tPass
+  end
+
   -- Clean up what is left of the temporary files.
+  if st.dir and LrFileUtils.exists(st.dir .. '/thumbs-out') then LrFileUtils.delete(st.dir .. '/thumbs-out') end
   local leftover = {}
   for _, p in ipairs(st.files or {}) do leftover[#leftover + 1] = p end
   export.cleanup(st.dir, leftover)
@@ -696,6 +962,7 @@ function M.run(o)
     fastDisabled = st.fastDisabled, reasons = st.reasons,
     longMin = st.longMin, longMax = st.longMax,
     avgKB = st.sentCount > 0 and (st.sentBytes / st.sentCount / 1024) or 0,
+    thumbSent = st.thumbSent, thumbFailed = st.thumbFailed,
   }
   local removedParts = {}
   for label, n in pairs(st.removed) do removedParts[#removedParts + 1] = label .. '=' .. n end
@@ -716,6 +983,21 @@ function M.run(o)
   local failedParts = {}
   for key, n in pairs(st.failedStatus) do failedParts[#failedParts + 1] = key .. 'x' .. n end
   table.sort(failedParts)
+  local thumbWhy = {}
+  for why, n in pairs(st.thumbWhy) do thumbWhy[#thumbWhy + 1] = why .. '=' .. n end
+  table.sort(thumbWhy)
+  local noThumb = math.max(st.uploaded - st.thumbSent - st.thumbSkipped, 0)
+  log.info('pipeline small versions: sent=%d none=%d alreadySmall=%d failed=%d (%s) stopped=%s paced=%s avg=%.0fKB long=%s..%s',
+    st.thumbSent, noThumb, st.thumbSkipped, st.thumbFailed, table.concat(thumbWhy, ' '),
+    tostring(o.thumbs ~= false and not st.thumbs), tostring(st.thumbPaced),
+    st.thumbSent > 0 and (st.thumbBytes / st.thumbSent / 1024) or 0,
+    tostring(st.thumbLongMin), tostring(st.thumbLongMax))
+  log.info('pipeline times: photoPUT=%.1fs/%d (%.2fs each) sips=%.1fs/%d calls (%d files) '
+    .. 'thumbPUT=%.1fs/%d (%.2fs each) thumbTail=%.1fs manifestPass=%.1fs (%d entries)',
+    st.uploadSeconds, st.uploadCalls, st.uploadCalls > 0 and (st.uploadSeconds / st.uploadCalls) or 0,
+    st.sipsSeconds, st.sipsCalls, st.sipsFiles,
+    st.thumbPutSeconds, st.thumbPutCalls, st.thumbPutCalls > 0 and (st.thumbPutSeconds / st.thumbPutCalls) or 0,
+    st.thumbTail or 0, st.passSeconds, st.passEntries)
   log.info('pipeline retries=%d parallelLowered=%d busyStop=%s failedUploads=[%s]',
     st.retries, st.lowered, tostring(st.busyStop), table.concat(failedParts, ' '))
 

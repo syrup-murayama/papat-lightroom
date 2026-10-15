@@ -42,8 +42,13 @@ local function hasJapanese(s)
   return type(s) == 'string' and s:find('[\227-\233]') ~= nil
 end
 
+local SERVER_TEXT_MAX = 300 -- characters; the server's wording is shown in a dialog
+
 local function describe(status, code, serverMessage, retryAfter, data)
   code = code or ''
+  -- whatever the server wrote is shown as one line of at most 300 characters
+  serverMessage = text.oneLine(serverMessage, SERVER_TEXT_MAX)
+  if serverMessage == '' then serverMessage = nil end
 
   if status == 0 then
     return 'papat に接続できませんでした。インターネットの接続を確認して、もう一度お試しください。'
@@ -51,18 +56,19 @@ local function describe(status, code, serverMessage, retryAfter, data)
 
   -- 409: the code matters; the status alone says nothing useful
   if code == 'active_gallery_limit' then
-    local max = data and tonumber(data.max_active_galleries) or 10
+    -- the number is the server's: say it only when the server sent it
+    local max = data and tonumber(data.max_active_galleries) or nil
     return string.format(
-      '公開中のギャラリーが上限の%d件に達しています。papat のダッシュボード（%s）で不要なギャラリーを終了するか、'
+      '公開中のギャラリーが上限%sに達しています。papat のダッシュボード（%s）で不要なギャラリーを終了するか、'
         .. '期限が切れるのを待ってから、もう一度お試しください。',
-      max, config.DASHBOARD_URL
+      max and string.format('の%d件', max) or '', config.DASHBOARD_URL
     )
   end
   if code == 'idempotency_conflict' then
     return '同じ操作がまだ処理中です。少し待ってから、もう一度お試しください。'
   end
   if code == 'extension_already_used' then
-    return 'このギャラリーの延長はすでに使われています（保存期間は最長14日です）。'
+    return 'このギャラリーの延長はすでに使われています。'
   end
   if code == 'gallery_closed' then
     return 'このギャラリーはすでに終了しています。新しくギャラリーを作成してください。'
@@ -73,7 +79,12 @@ local function describe(status, code, serverMessage, retryAfter, data)
       .. '）でキーを発行し直し、ファイル → プラグインマネージャー → papat に入力してください。'
   end
   if code == 'monthly_limit' then
-    return '初回請求の成功までは、月20単位が上限です。請求が成功した後に、もう一度お試しください。'
+    -- the limit (and its number) belongs to the server and changes: show its wording; without it,
+    -- a sentence that names no number
+    if hasJapanese(serverMessage) then
+      return serverMessage .. '（ダッシュボード: ' .. config.DASHBOARD_URL .. '）'
+    end
+    return '今月の利用の上限に達しています。請求が成功した後に、もう一度お試しください。'
       .. '（ダッシュボード: ' .. config.DASHBOARD_URL .. '）'
   end
   if code == 'card_required' or code == 'payment_required' then
@@ -298,6 +309,7 @@ local function withRetry(call, label)
   res.tries = 1
   local waited = 0
   local rechecked = false
+  local rateLimited = (res.status == 429) -- the final answer says whether a 429 was seen (res.rateLimited)
 
   while not res.ok do
     local retries = res.tries - 1
@@ -318,9 +330,11 @@ local function withRetry(call, label)
     local tries = res.tries
     res = call()
     res.tries = tries + 1
+    if res.status == 429 then rateLimited = true end
   end
 
   res.waited = waited
+  res.rateLimited = rateLimited
   return res
 end
 
@@ -381,6 +395,18 @@ function M.putPhoto(apiKey, sid, filename, bytes)
       timeout = TIMEOUT_UPLOAD,
     })
   end, filename)
+end
+
+--- PUT the small version of a photo (thumbs/<same name>). The photo must be on the server first.
+function M.putThumb(apiKey, sid, filename, bytes)
+  local path = filePath(sid, 'thumbs/' .. filename)
+  return withRetry(function()
+    return request('PUT', path, apiKey, {
+      body = bytes,
+      contentType = 'image/jpeg',
+      timeout = TIMEOUT_UPLOAD,
+    })
+  end, 'thumb ' .. filename)
 end
 
 function M.putManifest(apiKey, sid, manifest)
