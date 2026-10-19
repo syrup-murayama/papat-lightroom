@@ -7,7 +7,7 @@ return {
   LrPluginInfoProvider = 'PluginInfoProvider.lua',
   LrMetadataProvider = 'Metadata.lua',
   LrMetadataTagsetFactory = 'Tagset.lua',
-  VERSION = { major = 1, minor = 2, revision = 0, build = 0 },
+  VERSION = { major = 1, minor = 2, revision = 1, build = 0 },
   LrLibraryMenuItems = {
     {
       title = 'papat でギャラリーを作る…',

@@ -20,6 +20,7 @@ local api = load('api')
 local pipeline = load('pipeline')
 local jobs = load('jobs')
 local ui = load('ui')
+local report = load('report')
 local log = load('log')
 
 local M = {}
@@ -133,7 +134,7 @@ local function sendOne(context, a)
         .. '写真ファイルが見つかるか（「？」マークが付いていないか）を確認して、もう一度お試しください。',
       'critical'
     )
-    return
+    return nil
   end
 
   local sent = already + result.uploaded
@@ -177,21 +178,35 @@ local function sendOne(context, a)
   else
     LrDialogs.showBezel(string.format('papat: %s%d 枚の送信が完了しました', prefix, sent), 4)
   end
+  return result
 end
 
 --- Several galleries, sent one after another in one background task (1.2.0's auto-split: the
 --- photographer confirms once, the galleries line up in "最近のギャラリー" as each finishes).
 --- A failure in one (fatal, busyStop, canceled) does not stop the rest — each is its own
 --- gallery, exactly as if it had been sent on its own; only the per-gallery dialog says so.
+---
+--- "送信の記録" (1.2.1, opt-in): every segment here is one operation's worth (a split send's
+--- several galleries fold into the one report list[1].apiKey's account gets; a lone M.start
+--- call is itself a complete, 1-segment operation — the same code path either way). A segment
+--- list[i].simUsed (optional, a shared { any = boolean } table CreateGallery.lua fills in as
+--- lib/similarity.lua finishes) marks the whole report's similarity.used when any segment's
+--- grouping was actually used.
 --- @param list table  array of M.start's own `a` shape; list[i].status may be the same object
 ---   for all of them (a single status line follows "whichever gallery is sending now")
 function M.startMany(list)
   LrTasks.startAsyncTask(function()
     LrFunctionContext.callWithContext('papatSend', function(context)
       LrDialogs.attachErrorDialogToFunctionContext(context)
+      local collector = report.newCollector()
       for _, a in ipairs(list) do
-        sendOne(context, a)
+        local result = sendOne(context, a)
+        if result then
+          report.addSegment(collector, a.sid, result, { similarityUsed = a.simUsed and a.simUsed.any })
+        end
       end
+      local apiKey = list[1] and list[1].apiKey
+      report.finish(apiKey, collector)
     end)
   end)
 end

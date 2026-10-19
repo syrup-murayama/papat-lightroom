@@ -66,4 +66,19 @@ function M.prefs()
   return LrPrefs.prefsForPlugin()
 end
 
+--- "送信の記録" (1.2.1): asked once (CreateGallery.lua, the first gallery created after
+--- updating); the Plug-in Manager checkbox can change the choice afterwards. `asked` on its
+--- own tells whether the one-time dialog is still owed; it stays true forever once shown (or
+--- once the Plug-in Manager checkbox is touched directly, which counts as having decided).
+function M.reportStatus()
+  local prefs = LrPrefs.prefsForPlugin()
+  return { asked = prefs.reportAsked == true, consent = prefs.reportConsent == true }
+end
+
+function M.setReportConsent(consent)
+  local prefs = LrPrefs.prefsForPlugin()
+  prefs.reportAsked = true
+  prefs.reportConsent = consent == true
+end
+
 return M

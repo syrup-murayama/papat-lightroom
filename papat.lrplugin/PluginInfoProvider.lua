@@ -22,6 +22,7 @@ local location = dofile(_PLUGIN.path .. '/lib/location.lua')
 local ui = dofile(_PLUGIN.path .. '/lib/ui.lua')
 local log = dofile(_PLUGIN.path .. '/lib/log.lua')
 local editor = dofile(_PLUGIN.path .. '/lib/editor.lua')
+local report = dofile(_PLUGIN.path .. '/lib/report.lua')
 
 local PluginInfoProvider = {}
 
@@ -46,6 +47,12 @@ local SEND_OPTIONS = {
     title = '速く送る（書き出しの代わりに Lightroom のプレビューから送る）' },
 }
 
+-- "送信の記録"（1.2.1・オプトイン）。初めてギャラリーを作るとき一度だけ聞くダイアログ
+-- （report.askOnce）と同じ設定。ここで触れると、その回答として扱う（二度は聞かれない）。
+local REPORT_OPTIONS = {
+  { key = 'reportConsent', default = false, title = '送信の速さとエラーの記録を、papat に送る' },
+}
+
 local function refreshKeyStatus(props)
   local key = credentials.get()
   if key ~= '' then
@@ -60,6 +67,7 @@ local function bindPrefs(props)
   local all = {}
   for _, opt in ipairs(OPTIONS) do all[#all + 1] = opt end
   for _, opt in ipairs(SEND_OPTIONS) do all[#all + 1] = opt end
+  for _, opt in ipairs(REPORT_OPTIONS) do all[#all + 1] = opt end
   for _, opt in ipairs(all) do
     if prefs[opt.key] == nil then
       props[opt.key] = opt.default
@@ -74,6 +82,8 @@ local function bindPrefs(props)
       local key = opt.key
       props:addObserver(key, function()
         prefs[key] = props[key] == true
+        -- この画面で触れること自体を「決めた」とみなす（report.askOnce を二度出さない）
+        if key == 'reportConsent' then prefs.reportAsked = true end
         log.info('preference changed: %s=%s', key, tostring(prefs[key]))
       end)
     end
@@ -235,6 +245,16 @@ local function buildSections(f, props)
     }
   end
 
+  local reportRows = {}
+  for _, opt in ipairs(REPORT_OPTIONS) do
+    reportRows[#reportRows + 1] = f:checkbox {
+      title = opt.title,
+      value = bind(opt.key),
+      checked_value = true,
+      unchecked_value = false,
+    }
+  end
+
   -- height_in_lines follows the text: a fixed number cuts whatever wraps beyond it
   local sendIntro = 'ギャラリーの作成後、写真は裏で書き出しと送信を並行して進め、Lightroom で他の作業を続けられます。'
     .. '\n画像には、Lightroom に登録した著作権情報・作成者・連絡先が入ります。'
@@ -266,6 +286,27 @@ local function buildSections(f, props)
         text_color = GREY,
         width = 520,
         height_in_lines = text.linesFor(fastNote, 520, 10),
+      },
+    },
+  }
+
+  local reportNote = '写真・ファイル名・ギャラリーの題・パスコードは含みません。送る内容は、送信の速さ（時間）、'
+    .. 'プレビュー・書き出しの枚数、失敗やエラーの種類（内容の文は含みません）、Lightroom・macOS の版などです。'
+  local reportSection = {
+    title = 'papat — 送信の記録',
+    f:column {
+      spacing = f:control_spacing(),
+      f:static_text {
+        title = report.SETTINGS_INTRO,
+        width = 520,
+        height_in_lines = text.linesFor(report.SETTINGS_INTRO, 520, 2),
+      },
+      f:column(reportRows),
+      f:static_text {
+        title = reportNote,
+        text_color = GREY,
+        width = 520,
+        height_in_lines = text.linesFor(reportNote, 520, 3),
       },
     },
   }
@@ -491,9 +532,11 @@ local function buildSections(f, props)
     },
   }
 
-  -- order follows the work: connect, send (アタリ送付), the wording (案内文), receive (セレクト受け取り), about
+  -- order follows the work: connect, send (アタリ送付), 送信の記録, the wording (案内文),
+  -- receive (セレクト受け取り), about
   table.insert(sections, 2, sendSection)
-  table.insert(sections, 3, templateSection)
+  table.insert(sections, 3, reportSection)
+  table.insert(sections, 4, templateSection)
 
   -- Loaded from the standard Modules folder: no warning, no button, one line above.
   if props.locationWarn then

@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.1
+
+- 使用許諾：第3版（2026-10-20）。「3. プラグインが送るもの」の
+  末尾に、「送信の記録」（許可した場合だけ、改善のために送る送信の速さ・エラーの種類など。写真・
+  ファイル名・ギャラリーの題・パスコードは含まない）についての1文を追記（日英）。版と履歴は `docs/license-history.md`
+- **feat: 送信の記録（オプトイン）** (`lib/report.lua`, `lib/sender.lua`, `CreateGallery.lua`,
+  `PluginInfoProvider.lua`). 初めてギャラリーを作るときに一度だけ確認し、許可した人だけ、送信が
+  終わるたびに1件（分割したら1回の操作で1件）、送信の速さとエラーの記録を `POST
+  /api/v1/integration/report` に送る（papat のサーバーが、許した項目だけを保存する）。写真・ファイル名・ギャラリーの題・パスコード・パス・ユーザー名・Mac の名前は
+  送らない。`os`/`lightroom`/`arch` は版の数字だけ、またはあらかじめ決めた値だけに絞って作り、
+  システムの文字列をそのまま渡さない（監査16の申し送り）。記録の送信に失敗しても、利用者には
+  何も出さず、やり直しもしない。あとからプラグインマネージャーの設定で変更できる。
+  `export_reasons` に `preview_first_big`／`preview_small_then_big`／`preview_small_timeout`
+  （小さく速い最初の callback のあと、待った結果どうだったか。上の speed-first の直しそのものの
+  実測）を追記し、`probe` に最初の3枚の `{w,h,seconds,reason}` を追記（`lib/preview.lua`,
+  `lib/pipeline.lua`）
+- **fix: speed-first — a bad probe sample no longer exports the whole gallery** (`lib/pipeline.lua`,
+  `lib/preview.lua`). 2026-10-19 field report: 582 photos, "speed first" on, a probe logged
+  `0.01s small` for a photo whose catalog preview setting was Auto/4112px — far too fast and far
+  too small to be the real preview — and the whole gallery (all 582) fell back to export because
+  the probe's 3-photo sample decided for everyone up front. Fixed:
+  - the probe (first/middle/last) is now diagnostic only — logged, but it no longer decides
+    whether the rest of the gallery even tries a preview; every photo gets its own attempt and
+    its own export fallback
+  - the probe log shows the preview's actual size for a rejected photo instead of `-`
+  - a first callback that is both too small and suspiciously fast (< 0.3 s) now holds the
+    request open for up to 5 more seconds, in case Lightroom answers again with the real,
+    properly rendered preview (`lib/preview.lua`'s `opts.minEdge`) — not yet confirmed against
+    the real SDK; see `spike/preview-freshness`'s "Freshness15s" tool, used to check whether a
+    second callback actually happens on a real Mac
+  - a genuinely small preview (not suspiciously fast) is still trusted immediately, so a catalog
+    whose standard preview size is set low does not pay the extra wait on every photo for nothing
+  - **audit 17 §4.1**: once a send has seen 3 `small_timeout` outcomes and 0 `small_then_big`,
+    the 5s wait stops for the rest of that send (trusts the first callback immediately from
+    then on) — without this, a send whose "2nd callback" theory never pays off could pay the
+    full 5s on every small photo (1,000 photos, half placeholders that never improve: ~42
+    minutes on top of the export itself). Bounds the worst case at 3 × 5s = 15s per send. A
+    single `small_then_big` keeps the wait on for the rest of the send regardless of how many
+    timeouts pile up alongside it (the theory is confirmed for that send, so it keeps paying off)
+
 ## 1.2.0
 
 - 使用許諾：第2版（2026-10-15 に承認）。「3. プラグインが送るもの」の末尾に、

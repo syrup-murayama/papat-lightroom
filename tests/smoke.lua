@@ -410,6 +410,11 @@ local function newPhoto(path, props)
       cb(jpegBytes('preview-' .. path, false, self.thumbDims[1], self.thumbDims[2], true), nil)
     elseif self.thumbSmall then
       cb(jpegBytes('preview-' .. path, false, 1440, 960, true), nil)
+    elseif self.thumbSmallThenBig then
+      -- 2026-10-19 field theory: a quick, too-small placeholder immediately followed by the
+      -- real, properly rendered preview (lib/preview.lua's opts.minEdge is meant to catch this)
+      cb(jpegBytes('preview-small-' .. path, false, 1440, 960, true), nil)
+      cb(jpegBytes('preview-' .. path, false, 2056, 1371, true), nil)
     elseif self.thumbExif then
       cb(jpegBytes('camera-jpeg-' .. path, true, 2056, 1371, true), nil)
     else
@@ -486,7 +491,14 @@ local function newCatalog(photos)
 end
 
 local activeCatalog
-modules.LrApplication = { activeCatalog = function() return activeCatalog end }
+modules.LrApplication = {
+  activeCatalog = function() return activeCatalog end,
+  versionTable = function() return env.lrVersion or { major = 14, minor = 5, revision = 1 } end,
+}
+modules.LrSystemInfo = {
+  osVersion = function() return env.osVersion or 'macOS 15.1' end,
+  architecture = function() return env.arch or 'x64' end,
+}
 
 modules.LrExportSession = function(args)
   local session = {}
@@ -814,6 +826,14 @@ local serverState
 local function bigServer()
   serverState = { photos = {}, thumbs = {}, order = {}, times = {}, manifestCalls = 0, deleted = false, failName = nil }
   return function(req)
+    if req.method == 'POST' and req.url:find('/integration/report') then
+      serverState.reports = serverState.reports or {}
+      serverState.reports[#serverState.reports + 1] = json.decode(req.body)
+      if env.reportStatus then
+        return env.reportStatus, { ok = false, code = env.reportCode or 'error', error = 'x' }
+      end
+      return 200, { ok = true }
+    end
     if req.method == 'POST' and req.url:find('/galleries$') then
       return 201, { ok = true, sid = 'SIDP', tenant_id = 'abc123', path = '/t/abc123/s/SIDP', expires_at = iso(7) }
     end
@@ -1549,7 +1569,8 @@ for _, dlg in ipairs(env.dialogs) do
 end
 check(failDialog ~= nil, 'sanitize failure: the photographer is told (' .. tostring(failDialog and failDialog.title) .. ')')
 
--- speed-first, probe says "no": previews missing / too big -> everything is exported from the start
+-- speed-first, a bad probe sample no longer dooms the whole gallery (2026-10-19 fix): each
+-- photo still gets its own attempt even when the probe itself looked unusable
 local function timingOf(sid)
   for _, e in ipairs(json.decode(env.passwords.recentGalleries)) do
     if e.sid == sid then return e.timing end
@@ -1565,10 +1586,10 @@ env.passwords.recentGalleries = nil
 env.thumbRequests, env.exportedCount = 0, 0
 run('CreateGallery.lua')
 check(#serverState.photos == 6, 'probe: all six photos arrive (' .. #serverState.photos .. ')')
-check(env.thumbRequests == 3, 'probe: only the three probes asked for a preview (' .. env.thumbRequests .. ')')
-check(env.exportedCount == 6, 'probe: everything exported when previews are not usable (' .. env.exportedCount .. ')')
+check(env.thumbRequests == 6, 'probe: every photo gets its own preview attempt (' .. env.thumbRequests .. ')')
+check(env.exportedCount == 5, 'probe: only the five bad ones are exported, not all six (' .. env.exportedCount .. ')')
 local line = timingOf('SIDP') or ''
-check(line:find('このカタログではプレビューを使えなかった', 1, true) ~= nil, 'probe: the result says previews were not usable')
+check(line:find('プレビューから 1 枚・書き出しで 5 枚', 1, true) ~= nil, 'probe: the one good photo still used its preview')
 check(line:find('標準サイズのプレビューを作っておくと速くなります', 1, true) ~= nil, 'probe: the result hints at building standard previews')
 
 -- probe is fine, later photos fail: three in a row and the rest is exported
@@ -1606,7 +1627,101 @@ env.exportedCount = 0
 run('CreateGallery.lua')
 check(env.exportedCount == 3, 'small preview: exported instead (' .. env.exportedCount .. ')')
 
--- previews that are rendered on demand (slow probes) are no faster than exporting: export from the start
+-- 2026-10-19: the probe log shows the real size for a rejected probe (it used to always say
+-- "-", which is what hid the field incident this fix responds to)
+photos = manyPhotos(3)
+photos[1].thumbSmall = true
+activeCatalog = newCatalog(photos)
+env.server = bigServer()
+env.prefs = { locationPromptShown = true, fastMode = true }
+env.passwords.recentGalleries = nil
+env.exportedCount = 0
+env.logLines = {}
+run('CreateGallery.lua')
+local sawRealSize = false
+for _, l in ipairs(env.logLines) do
+  if l:find('probe photo 1: 1440x960', 1, true) then sawRealSize = true end
+end
+check(sawRealSize, 'probe log: shows the real size for a rejected probe instead of "-"')
+
+-- a suspiciously fast, too-small first callback followed by a bigger one is used, not
+-- exported (2026-10-19 field theory: Lightroom answers once with whatever cheap placeholder
+-- it has on hand, then again with the real preview, when the standard preview was not
+-- actually cached — see lib/preview.lua's opts.minEdge)
+photos = manyPhotos(3)
+photos[1].thumbSmallThenBig = true
+activeCatalog = newCatalog(photos)
+env.server = bigServer()
+env.prefs = { locationPromptShown = true, fastMode = true }
+env.passwords.recentGalleries = nil
+env.exportedCount = 0
+env.logLines = {}
+run('CreateGallery.lua')
+check(env.exportedCount == 0, 'second callback: the bigger, later callback is used instead of exporting (' .. env.exportedCount .. ')')
+local sawTwoCallbacks = false
+for _, l in ipairs(env.logLines) do
+  if l:find('probe photo 1:', 1, true) and l:find('calls=2', 1, true) then sawTwoCallbacks = true end
+end
+check(sawTwoCallbacks, 'second callback: the probe log shows two callbacks for photo 1')
+
+-- audit 17 §4.1: once this send has seen 3 small_timeout outcomes and 0 small_then_big, the
+-- 5s settle-wait stops for the rest of THIS send — a catalog where the "2nd callback" theory
+-- never pays off does not keep paying 5s per small photo for hundreds of photos. Good photos
+-- are interspersed so the PRE-EXISTING PREVIEW_GIVE_UP streak (3 *consecutive* failures) never
+-- fires on its own and muddies what is being measured here — every other photo is good, so
+-- failuresInRow never exceeds 1 regardless of this fix.
+photos = manyPhotos(11)
+for _, i in ipairs({ 2, 4, 6, 8, 10 }) do photos[i].thumbSmall = true end -- 5 small, never improve
+activeCatalog = newCatalog(photos)
+env.server = bigServer()
+env.prefs = { locationPromptShown = true, fastMode = true }
+env.passwords.recentGalleries = nil
+env.exportedCount = 0
+env.sleeps, env.logLines = {}, {}
+run('CreateGallery.lua')
+check(env.exportedCount == 5, 'settle give-up: the five small photos are still exported ('
+  .. env.exportedCount .. ')')
+local settleTicks = 0
+for _, s in ipairs(env.sleeps) do if s >= 0.04 and s <= 0.06 then settleTicks = settleTicks + 1 end end
+-- 5 small photos * 5s / 0.05s-per-tick = up to 500 ticks if every one waited the full settle
+-- window; with the give-up, only the first 3 (wherever probing/order puts them) pay it in
+-- full = ~300 (±a couple for floating-point drift in the 0.05s accumulation), not ~500.
+check(settleTicks >= 290 and settleTicks <= 320, 'settle give-up: roughly 3 photos\' worth of '
+  .. 'waiting, not 5 (' .. settleTicks .. ' ticks of ~0.05s, expected ~300)')
+local sawGiveUpLog = false
+for _, l in ipairs(env.logLines) do
+  if l:find('small_timeout, 0 small_then_big', 1, true) then sawGiveUpLog = true end
+end
+check(sawGiveUpLog, 'settle give-up: logged once')
+
+-- ... but a single small_then_big this send means the hypothesis IS paying off here, so the
+-- wait never gets switched off, however many small_timeout outcomes pile up alongside it. The
+-- small_then_big is placed first (photo 1, always probed) so it is counted before any of the
+-- plain-small photos could otherwise reach the give-up threshold.
+photos = manyPhotos(11)
+photos[1].thumbSmallThenBig = true
+for _, i in ipairs({ 3, 5, 7, 9 }) do photos[i].thumbSmall = true end -- 4 small, never improve
+activeCatalog = newCatalog(photos)
+env.server = bigServer()
+env.prefs = { locationPromptShown = true, fastMode = true }
+env.passwords.recentGalleries = nil
+env.exportedCount = 0
+env.sleeps, env.logLines = {}, {}
+run('CreateGallery.lua')
+check(env.exportedCount == 4, 'settle kept on: the four genuinely-small photos are exported, '
+  .. 'photo 1 used its (eventually big) preview (' .. env.exportedCount .. ')')
+local keptTicks = 0
+for _, s in ipairs(env.sleeps) do if s >= 0.04 and s <= 0.06 then keptTicks = keptTicks + 1 end end
+check(keptTicks >= 380, 'settle kept on: all four small photos still pay the full 5s wait, '
+  .. 'because this send also has a small_then_big (' .. keptTicks .. ' ticks, expected ~400)')
+local sawGiveUpLog2 = false
+for _, l in ipairs(env.logLines) do
+  if l:find('small_timeout, 0 small_then_big', 1, true) then sawGiveUpLog2 = true end
+end
+check(not sawGiveUpLog2, 'settle kept on: never logged (the hypothesis held for this send)')
+
+-- previews that are rendered on demand (slow probes) are still used per photo (2026-10-19:
+-- this used to make the whole gallery export from the start on the probe's say alone)
 photos = manyPhotos(5)
 activeCatalog = newCatalog(photos)
 env.server = bigServer()
@@ -1616,8 +1731,8 @@ env.thumbRequests, env.exportedCount = 0, 0
 env.thumbSeconds = 1.1
 run('CreateGallery.lua')
 env.thumbSeconds = nil
-check(env.thumbRequests == 3 and env.exportedCount == 5, 'slow probe: everything is exported (' .. env.thumbRequests .. ' previews asked, ' .. env.exportedCount .. ' exported)')
-check((timingOf('SIDP') or ''):find('このカタログではプレビューを使えなかった', 1, true) ~= nil, 'slow probe: result explains it')
+check(env.thumbRequests == 5 and env.exportedCount == 0, 'slow probe: every photo still uses its (slow) preview (' .. env.thumbRequests .. ' previews asked, ' .. env.exportedCount .. ' exported)')
+check((timingOf('SIDP') or ''):find('プレビューから 5 枚・書き出しで 0 枚', 1, true) ~= nil, 'slow probe: the result counts them as previews, not exports')
 
 -- small originals / tight crops: a preview as small as the export would be is fine; the sRGB tag is added
 photos = manyPhotos(3)
@@ -2244,12 +2359,14 @@ do
   local titles = {}
   for _, sec in ipairs(sections) do titles[#titles + 1] = sec.title end
   check(titles[1] == 'papat — インストール場所' and titles[2] == 'papat — 接続' and titles[3] == 'papat — アタリ送付'
-    and titles[4] == 'papat — 案内文（クライアントに送る文面）' and titles[5] == 'papat — セレクト受け取り 反映設定',
-    'manager (not standard): location, connect, send, wording, receive (' .. table.concat(titles, ' | ') .. ')')
+    and titles[4] == 'papat — 送信の記録' and titles[5] == 'papat — 案内文（クライアントに送る文面）'
+    and titles[6] == 'papat — セレクト受け取り 反映設定',
+    'manager (not standard): location, connect, send, report, wording, receive (' .. table.concat(titles, ' | ') .. ')')
 end
-check(type(sections) == 'table' and #sections == 6, 'manager: six sections (location first when not standard)')
+check(type(sections) == 'table' and #sections == 7, 'manager: seven sections (location first when not standard)')
 check(props.keyStatus and props.keyStatus:find('設定済み') ~= nil and not props.keyStatus:find('EXAMPLEKEY'), 'manager: key masked')
 check(props.applyPick == true and props.applyMemo == true and props.applyTags == true and props.starCollections == false, 'manager: defaults (pick/memo/tags on, star sub-collections off)')
+check(props.reportConsent == false, 'manager: 送信の記録 defaults to off until asked or switched on')
 
 -- ---------------------------------------------------------------------------
 -- 6. Import (concept §11.2 defaults): collection + pick + memo appended + keywords
@@ -2383,12 +2500,12 @@ do
   end })
   local secs = provider.sectionsForTopOfDialog(fakeFactory(), propsStd)
   walkLayout(secs, 'manager (standard location)')
-  check(#secs == 5, 'manager (standard): no location section')
+  check(#secs == 6, 'manager (standard): no location section')
 do
   local titles = {}
   for _, sec in ipairs(secs) do titles[#titles + 1] = sec.title end
-  check(table.concat(titles, ' | ') == 'papat — 接続 | papat — アタリ送付 | papat — 案内文（クライアントに送る文面） | papat — セレクト受け取り 反映設定 | papat — バージョン',
-    'manager: sections in the order connect, send, wording, receive, version (' .. table.concat(titles, ' | ') .. ')')
+  check(table.concat(titles, ' | ') == 'papat — 接続 | papat — アタリ送付 | papat — 送信の記録 | papat — 案内文（クライアントに送る文面） | papat — セレクト受け取り 反映設定 | papat — バージョン',
+    'manager: sections in the order connect, send, report, wording, receive, version (' .. table.concat(titles, ' | ') .. ')')
 end
   check(propsStd.locationWarn == false and propsStd.locationStandard == true, 'manager (standard): no warning')
   check(propsStd.locationText == '標準の場所にインストールされています。', 'manager (standard): one line text')
@@ -2966,6 +3083,199 @@ do
     'similarity e2e: the helper\'s groups reach the manifest (' .. json.encode(byStem) .. ')')
 
   os.execute('rm -rf "' .. binDir .. '"')
+end
+
+-- ---------------------------------------------------------------------------
+-- "送信の記録"（1.2.1・オプトイン）: lib/report.lua
+-- ---------------------------------------------------------------------------
+do
+  local reportLib = dofile(_PLUGIN.path .. '/lib/report.lua')
+
+  local function lastConfirm()
+    for i = #env.dialogs, 1, -1 do
+      if env.dialogs[i].kind == 'confirm' and env.dialogs[i].title == 'papat' then return env.dialogs[i] end
+    end
+  end
+
+  -- first gallery after "updating to 1.2.1": asked once, exact wording, "送る" -> sent
+  photos = manyPhotos(3)
+  activeCatalog = newCatalog(photos)
+  env.server = bigServer()
+  env.prefs = { locationPromptShown = true, fastMode = true }
+  env.passwords.recentGalleries = nil
+  env.confirmAnswer = 'ok' -- "送る"
+  run('CreateGallery.lua')
+  local asked = lastConfirm()
+  check(asked ~= nil and asked.info == reportLib.CONSENT_TEXT, 'report: asked once, with the exact consent text')
+  check(env.prefs.reportAsked == true and env.prefs.reportConsent == true, 'report: consent recorded')
+  check(#(serverState.reports or {}) == 1, 'report: one report sent (' .. #(serverState.reports or {}) .. ')')
+
+  local rep = serverState.reports[1]
+  check(rep.client and rep.client.name == 'papat-lrc' and rep.client.version == pluginVersion,
+    'report: client name/version')
+  check(rep.lightroom == '14.5.1', 'report: lightroom token from LrApplication.versionTable (' .. tostring(rep.lightroom) .. ')')
+  check(rep.os == 'macOS-15.1', 'report: os token strips everything but digits/dots, never the raw string ('
+    .. tostring(rep.os) .. ')')
+  check(rep.arch == 'x64', 'report: arch token (' .. tostring(rep.arch) .. ')')
+  check(type(rep.sid) == 'table' and #rep.sid == 1 and rep.sid[1] == 'SIDP', 'report: sid of the one gallery created')
+  check(rep.split and rep.split.segments == 1, 'report: split.segments = 1 (no auto-split)')
+  check(rep.counts and rep.counts.total == 3 and rep.counts.preview == 3 and rep.counts.export == 0,
+    'report: counts (preview mode, nothing exported)')
+  check(rep.similarity and rep.similarity.used == false, 'report: similarity not used (helper unavailable, selection too small)')
+  check(type(rep.timings) == 'table' and type(rep.timings.wall) == 'number', 'report: timings.wall present')
+  check(rep.errors == nil or #rep.errors == 0, 'report: no errors')
+  do
+    local encoded = json.encode(rep)
+    check(not encoded:find('IMG_', 1, true) and not encoded:find('/p/', 1, true),
+      'report: no filename/path leaks into the body')
+  end
+
+  -- a second gallery, same session: not asked again, but still sent (consent already given)
+  env.dialogs = {}
+  env.server = bigServer() -- fresh serverState.reports
+  photos = manyPhotos(2)
+  activeCatalog = newCatalog(photos)
+  run('CreateGallery.lua')
+  check(lastConfirm() == nil, 'report: not asked a second time')
+  check(#(serverState.reports or {}) == 1, 'report: still sent once consent is already on file')
+
+  -- a photographer who answers "送らない": asked once, never sent, never asked again
+  env.prefs = { locationPromptShown = true, fastMode = true }
+  env.server = bigServer()
+  photos = manyPhotos(3)
+  activeCatalog = newCatalog(photos)
+  env.confirmAnswer = 'cancel' -- "送らない"
+  run('CreateGallery.lua')
+  env.confirmAnswer = nil
+  check(lastConfirm() ~= nil, 'report: still asked once for a photographer who has not been asked yet')
+  check(env.prefs.reportAsked == true and env.prefs.reportConsent == false, 'report: decline recorded')
+  check(serverState.reports == nil or #serverState.reports == 0, 'report: nothing sent after declining (' .. #(serverState.reports or {}) .. ')')
+  env.dialogs = {}
+  photos = manyPhotos(2)
+  activeCatalog = newCatalog(photos)
+  run('CreateGallery.lua')
+  check(lastConfirm() == nil, 'report: a photographer who declined is not asked again')
+  check(serverState.reports == nil or #serverState.reports == 0, 'report: still nothing sent after declining')
+
+  -- a failed send: the result still reaches the report (counted as an error, not a message)
+  env.prefs = { locationPromptShown = true, fastMode = true, reportAsked = true, reportConsent = true }
+  env.server = function(req)
+    if req.method == 'POST' and req.url:find('/integration/report') then
+      serverState = serverState or {}
+      serverState.reports = serverState.reports or {}
+      serverState.reports[#serverState.reports + 1] = json.decode(req.body)
+      return 200, { ok = true }
+    end
+    if req.method == 'POST' and req.url:find('/galleries$') then
+      return 201, { ok = true, sid = 'SIDERR', tenant_id = 'abc123', path = '/t/abc123/s/SIDERR', expires_at = iso(7) }
+    end
+    if req.method == 'PUT' and req.url:find('/files/photos/') then
+      return 503, { ok = false, code = 'upstream_error', error = '一時的なエラー' }
+    end
+    return 200, { ok = true }
+  end
+  photos = manyPhotos(2)
+  activeCatalog = newCatalog(photos)
+  env.dialogs = {}
+  run('CreateGallery.lua')
+  local errRep = serverState.reports[#serverState.reports]
+  check(errRep ~= nil and type(errRep.errors) == 'table' and #errRep.errors > 0, 'report: a failed send adds an error entry')
+  if errRep and errRep.errors and errRep.errors[1] then
+    check(errRep.errors[1].code ~= nil and errRep.errors[1].where ~= nil and errRep.errors[1].message == nil,
+      'report: error entries are code/where/count only, never a message')
+  end
+
+  -- a 2-segment send (lib/sender.lua directly: the auto-split needs 889+ photos to trigger
+  -- through the menu, too slow for a unit test) folds into exactly one combined report
+  do
+    local sender = dofile(_PLUGIN.path .. '/lib/sender.lua')
+    env.prefs = { locationPromptShown = true, fastMode = true, reportAsked = true, reportConsent = true }
+    env.server = bigServer()
+    local segPhotos = manyPhotos(4)
+    activeCatalog = newCatalog(segPhotos)
+    local items = {}
+    for i, p in ipairs(segPhotos) do
+      items[i] = { photo = p, sourceId = 'src-' .. i, datetime = '', rating = 0 }
+    end
+    local status = sender.newStatus('x')
+    sender.startMany({
+      {
+        apiKey = 'k', sid = 'SIDA', title = 'A（1/2）', items = { items[1], items[2] }, usedNames = {},
+        status = status, total = 2, alreadyUploaded = 0, fast = true,
+      },
+      {
+        apiKey = 'k', sid = 'SIDB', title = 'A（2/2）', items = { items[3], items[4] }, usedNames = {},
+        status = status, total = 2, alreadyUploaded = 0, fast = true,
+      },
+    })
+    drain()
+    check(#(serverState.reports or {}) == 1, 'report: one combined report for a 2-segment send ('
+      .. #(serverState.reports or {}) .. ')')
+    local split2 = serverState.reports[1]
+    if split2 then
+      check(split2.split and split2.split.segments == 2, 'report: split.segments = 2')
+      table.sort(split2.sid)
+      check(split2.sid[1] == 'SIDA' and split2.sid[2] == 'SIDB', 'report: both sids present ('
+        .. table.concat(split2.sid, ',') .. ')')
+      check(split2.counts and split2.counts.total == 4, 'report: counts summed across both segments')
+    end
+  end
+
+  -- a dangerous "os"/"arch" from the SDK never passes through raw
+  env.osVersion = "Daisuke's MacBook Pro"
+  env.arch = 'Daisukes-Mac'
+  env.prefs = { locationPromptShown = true, fastMode = true, reportAsked = true, reportConsent = true }
+  env.server = bigServer()
+  photos = manyPhotos(2)
+  activeCatalog = newCatalog(photos)
+  run('CreateGallery.lua')
+  env.osVersion, env.arch = nil, nil
+  local safetyRep = serverState.reports and serverState.reports[1]
+  check(safetyRep ~= nil, 'report: still sent even when the system strings look dangerous')
+  if safetyRep then
+    check(safetyRep.os == nil, 'report: a computer-name-shaped osVersion() yields no digits, so os is omitted, never passed through ('
+      .. tostring(safetyRep.os) .. ')')
+    check(safetyRep.arch == nil, 'report: an unrecognized architecture() string is omitted, never passed through ('
+      .. tostring(safetyRep.arch) .. ')')
+  end
+
+  -- The question behind the telemetry: how often does waiting past a small, fast
+  -- first callback turn up a bigger one? export_reasons carries it (the server allows any key,
+  -- up to 16), and probe carries the first 3 {w,h,seconds,reason} samples.
+  photos = manyPhotos(3)
+  photos[1].thumbSmallThenBig = true -- small, then (after waiting) big: preview_small_then_big
+  photos[2].thumbSmall = true -- small, stays small: preview_small_timeout
+  -- photos[3]: default, big from the first callback: preview_first_big
+  activeCatalog = newCatalog(photos)
+  env.server = bigServer()
+  env.prefs = { locationPromptShown = true, fastMode = true, reportAsked = true, reportConsent = true }
+  env.passwords.recentGalleries = nil
+  run('CreateGallery.lua')
+  local waitRep = serverState.reports and serverState.reports[#serverState.reports]
+  check(waitRep ~= nil, 'report: sent for the preview-wait scenario')
+  if waitRep then
+    local reasons = waitRep.export_reasons or {}
+    check(reasons.preview_small_then_big == 1, 'report: small-then-big counted once ('
+      .. tostring(reasons.preview_small_then_big) .. ')')
+    check(reasons.preview_small_timeout == 1, 'report: small-timeout counted once ('
+      .. tostring(reasons.preview_small_timeout) .. ')')
+    check(reasons.preview_first_big == 1, 'report: first-big counted once ('
+      .. tostring(reasons.preview_first_big) .. ')')
+    check(reasons.small == 1, 'report: the existing export reason (why photo 2 was exported) is still there too')
+    check(type(waitRep.probe) == 'table' and #waitRep.probe == 3, 'report: probe has the first three samples ('
+      .. tostring(waitRep.probe and #waitRep.probe) .. ')')
+    if waitRep.probe then
+      check(waitRep.probe[1].w == 2056 and waitRep.probe[1].h == 1371 and waitRep.probe[1].reason == 'ok',
+        'report: probe photo 1 (small-then-big, judged on the final size)')
+      check(waitRep.probe[2].w == 1440 and waitRep.probe[2].h == 960 and waitRep.probe[2].reason == 'small',
+        'report: probe photo 2 (stayed small, real size shown, not omitted)')
+      check(waitRep.probe[3].w == 2056 and waitRep.probe[3].h == 1371 and waitRep.probe[3].reason == 'ok',
+        'report: probe photo 3 (big from the start)')
+      for i, p in ipairs(waitRep.probe) do
+        check(type(p.seconds) == 'number' and p.seconds >= 0, 'report: probe ' .. i .. ' has a seconds value')
+      end
+    end
+  end
 end
 
 print(string.format('%d smoke checks, %d failed', total, failed))

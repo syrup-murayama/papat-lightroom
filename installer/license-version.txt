@@ -4,5 +4,5 @@
 #   1. raise `version`, set `date` (the day the new text is published),
 #   2. add the row to docs/license-history.md (scripts/check-license.sh prints the hashes).
 # scripts/check.sh and scripts/verify-pkg.sh fail when the text changed under the same version.
-version=2
-date=2026-10-15
+version=3
+date=2026-10-20

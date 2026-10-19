@@ -34,6 +34,7 @@ local guidance = load('guidance')
 local grouping = load('grouping')
 local jobs = load('jobs')
 local pipeline = load('pipeline')
+local report = load('report')
 local sender = load('sender')
 local photoinfo = load('photoinfo')
 local rights = load('rights')
@@ -368,6 +369,10 @@ local function run(context)
     return
   end
 
+  -- "送信の記録"（1.2.1・オプトイン）: 1.2.1 に更新した直後、初めてギャラリーを作るときに一度だけ
+  -- 聞く。あとはプラグインマネージャーの設定で変えられる（report.askOnce はその一度しか何もしない）。
+  report.askOnce()
+
   -- What the images will say about their author, the photographer's stars and the capture
   -- times: read before anything else. 1.2.0's auto-split needs the capture times (and, for a
   -- large selection, the similarity groups) to decide where to cut, before the settings dialog
@@ -396,6 +401,9 @@ local function run(context)
   -- 888 within 750-888, else within 888-maxPhotos; see lib/split.lua for the full rule and its
   -- fallbacks (no boundary in range; no grouping at all).
   local maxPhotos = update.maxPhotos()
+  -- "送信の記録"（1.2.1）用: どこかの似ている写真の計算が実際に使われたら true のまま（一度 true
+  -- になったら戻らない）。全セグメントの送信が終わったあとに sender.lua が一度だけ読む。
+  local simUsed = { any = false }
   local segments, combinedGroups = { #ordered }, nil
   if #ordered > split.TRIGGER then
     local progress = LrProgressScope {
@@ -409,10 +417,12 @@ local function run(context)
     -- trial measured far less), capped at 3 minutes either way.
     local budgetSeconds = math.min(180, 0.2 * #ordered)
     local groupsNow = {}
-    similarity.compute(ordered, groupsNow, {
+    if similarity.compute(ordered, groupsNow, {
       deadlineEpoch = os.time() + budgetSeconds,
       isCanceled = function() return progress:isCanceled() end,
-    })
+    }) then
+      simUsed.any = true
+    end
     progress:done()
     -- Whatever lib/similarity.lua could not finish (over budget, canceled, or any other
     -- failure) simply leaves groupsNow empty: the fallback below is the plain time groups,
@@ -495,7 +505,9 @@ local function run(context)
       end
       groupsNow._done = true
     else
-      LrTasks.startAsyncTask(function() similarity.compute(segItems, groupsNow) end)
+      LrTasks.startAsyncTask(function()
+        if similarity.compute(segItems, groupsNow) then simUsed.any = true end
+      end)
     end
 
     jobs.addRecent {
@@ -514,6 +526,7 @@ local function run(context)
       rightsMode = rightsMode, groupsNow = groupsNow,
       fast = config.settings().fastMode and not settings.exportNow, -- "export this time" wins
       label = (#segments > 1) and string.format('ギャラリー %d/%d', i, #segments) or nil,
+      simUsed = simUsed, -- "送信の記録"（1.2.1）: lib/sender.lua reads simUsed.any once all done
     }
     offset = offset + count
   end

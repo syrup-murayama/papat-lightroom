@@ -48,6 +48,13 @@ local PROBE_COUNT = 3         -- photos tried before deciding whether previews a
 local PROBE_SLOW = 0.8        -- seconds per probe: slower means previews are rendered on demand,
                               -- which is about as slow as exporting (observed: 0.25-0.32 s vs 1.29 s)
 local PREVIEW_TIMEOUT = 10    -- seconds to wait for one preview
+local PREVIEW_SETTLE = 5      -- extra seconds a too-small, suspiciously fast first callback
+                              -- gets to be followed by a bigger one (see lib/preview.lua's
+                              -- opts.minEdge; 2026-10-19 field report, provisional)
+local PREVIEW_SETTLE_GIVE_UP = 3  -- this many small_timeout outcomes with zero small_then_big
+                              -- in one send: stop waiting (audit 17 §4.1 — otherwise a send
+                              -- whose "2nd callback" hypothesis does not hold pays PREVIEW_SETTLE
+                              -- seconds per small photo for the whole send, not just 3 photos)
 local PREVIEW_GIVE_UP = 3     -- this many failures in a row: export the rest
 local TROUBLE_LOWER = 2       -- this many troubled uploads in a row: one upload at a time
 local CLEAN_RECOVER = 5       -- this many clean uploads in a row: back to the full parallelism
@@ -202,6 +209,7 @@ function M.run(o)
     uploadSeconds = 0, uploadCalls = 0, renderSeconds = 0,
     t0 = now(),
     previewOk = 0, previewFallback = 0, previewTagged = 0, metaAdded = 0, reasons = {}, fastDisabled = false,
+    waitOutcomes = {}, probeSamples = {}, settleDisabled = false, -- "送信の記録"・audit 17 §4.1
     allowed = concurrency, trouble = 0, clean = 0, failStreak = 0, lowered = 0,
     retries = 0, busyStop = false, failedStatus = {},
     longMin = nil, longMax = nil, sentBytes = 0, sentCount = 0,
@@ -444,18 +452,28 @@ function M.run(o)
       --   embedded  still carries Exif / XMP / IPTC: the camera's embedded JPEG, not a preview
       --             rendered by Lightroom (rendered previews carry none) — it would not show the edit
       --   large     longer than MAX_PREVIEW_EDGE
-      --   small     shorter than MIN_PREVIEW_EDGE
-      local function judge(bytes, item)
+      --   small     shorter than minEdge (see minimumEdgeFor)
+      -- The report (width/height) is returned even on rejection, purely so the probe log below
+      -- can show the actual size instead of "-" (2026-10-19: it used to be thrown away).
+      local function judge(bytes, item, minEdge)
         local clean, report = jpeg.sanitize(bytes)
         if not clean then return nil, nil, 'invalid' end
         local r = report.removed
-        if r.exif or r.xmp or r.iptc or r['app1-other'] then return nil, nil, 'embedded' end
+        if r.exif or r.xmp or r.iptc or r['app1-other'] then return nil, report, 'embedded' end
         local long = math.max(report.width, report.height)
-        if long > MAX_PREVIEW_EDGE then return nil, nil, 'large' end
+        if long > MAX_PREVIEW_EDGE then return nil, report, 'large' end
+        if long < minEdge then return nil, report, 'small' end
 
-        -- A small picture (or a tight crop) is legitimately smaller than 2048 px; an export would
-        -- not enlarge it either (LR_size_doNotEnlarge). Only a preview that is smaller than
-        -- what the export would deliver counts as "small".
+        -- sRGB profile (a normal export has one) and the copyright / creator / contact segments
+        clean, report = addBack(clean, report, item)
+        return clean, report
+      end
+
+      -- A small picture (or a tight crop) is legitimately smaller than 2048 px; an export would
+      -- not enlarge it either (LR_size_doNotEnlarge). Only a preview that is smaller than what
+      -- the export would deliver counts as "small" (passed to preview.jpeg too: see its own
+      -- comment on opts.minEdge / the 2026-10-19 field report this responds to).
+      local function minimumEdgeFor(item)
         local minimum = MIN_PREVIEW_EDGE
         local okSize, w, h = LrTasks.pcall(function()
           return item.photo:getRawMetadata('croppedWidth'), item.photo:getRawMetadata('croppedHeight')
@@ -463,26 +481,60 @@ function M.run(o)
         if okSize and tonumber(w) and tonumber(h) and math.max(w, h) > 0 then
           minimum = math.min(MIN_PREVIEW_EDGE, math.floor(math.max(w, h) * 0.95))
         end
-        if long < minimum then return nil, nil, 'small' end
-
-        -- sRGB profile (a normal export has one) and the copyright / creator / contact segments
-        clean, report = addBack(clean, report, item)
-        return clean, report
+        return minimum
       end
 
+      -- Returns clean, report, reason, calls, waitOutcome — calls is how many times
+      -- requestJpegThumbnail actually called back; waitOutcome is preview.jpeg's own
+      -- first_big / small_then_big / small_timeout / nil (see its comment — the
+      -- question behind it, answered per photo, aggregated below for "送信の記録").
+      --
+      -- st.settleDisabled (audit 17 §4.1): once this send has seen PREVIEW_SETTLE_GIVE_UP
+      -- small_timeout outcomes with zero small_then_big, the 5 s wait stops paying off here —
+      -- waiting past a small, suspiciously fast first callback is turned off for the rest of
+      -- this send (settleSeconds = 0: preview.jpeg trusts that first callback at once, same as
+      -- a catalog whose preview is genuinely small). Worst case is now bounded at
+      -- PREVIEW_SETTLE_GIVE_UP * PREVIEW_SETTLE (3 * 5 s = 15 s) instead of 5 s per photo for
+      -- the whole send. A single small_then_big resets nothing on its own (the hypothesis is
+      -- confirmed for this send, so the wait keeps paying for itself) — only countWait below
+      -- ever flips settleDisabled, and only once.
       local function fetch(item)
-        local bytes, why = preview.jpeg(item.photo, 2048, PREVIEW_TIMEOUT)
-        if not bytes then return nil, nil, (why == 'timeout') and 'timeout' or 'none' end
-        return judge(bytes, item)
+        local minEdge = minimumEdgeFor(item)
+        local bytes, why, calls, waitOutcome = preview.jpeg(item.photo, 2048, PREVIEW_TIMEOUT,
+          { minEdge = minEdge, settleSeconds = st.settleDisabled and 0 or PREVIEW_SETTLE })
+        if not bytes then return nil, nil, (why == 'timeout') and 'timeout' or 'none', calls, waitOutcome end
+        local clean, report, reason = judge(bytes, item, minEdge)
+        return clean, report, reason, calls, waitOutcome
       end
 
       local function count(reason)
         st.reasons[reason] = (st.reasons[reason] or 0) + 1
       end
 
-      -- 1. Probe a few photos (first / middle / last) and decide for the whole run: a catalog
-      --    whose previews are missing or are camera JPEGs is exported from the start instead
-      --    of getting slower half-way through.
+      -- "送信の記録"（1.2.1）用、probe/preview.jpeg の結果を別に数える（st.reasons とは別の軸:
+      -- 「なぜ書き出しになったか」ではなく「待った結果どうだったか」）。lib/report.lua が
+      -- export_reasons に合算して送る。
+      local function countWait(outcome)
+        if not outcome then return end
+        st.waitOutcomes[outcome] = (st.waitOutcomes[outcome] or 0) + 1
+        -- audit 17 §4.1: 3 timeouts with 0 confirmations this send means the wait is not
+        -- paying for itself here — stop paying it, for the rest of this send (see fetch()).
+        if not st.settleDisabled
+          and (st.waitOutcomes.small_timeout or 0) >= PREVIEW_SETTLE_GIVE_UP
+          and (st.waitOutcomes.small_then_big or 0) == 0
+        then
+          st.settleDisabled = true
+          log.info('speed-first: %d small_timeout, 0 small_then_big this send — no longer waiting on a small first callback',
+            st.waitOutcomes.small_timeout)
+        end
+      end
+
+      -- 1. Probe a few photos (first / middle / last): logged only, to help diagnose a
+      --    catalog's preview behaviour (and exercise the settle-wait above on a few photos
+      --    up front). It no longer decides whether the rest of the gallery even tries a
+      --    preview — every photo gets its own attempt and its own fallback below (2026-10-19:
+      --    a single bad probe sample used to make this export all 582 photos of an otherwise
+      --    fine gallery; see docs/preview-freshness-notes.md).
       local probe = {}
       local n = #o.items
       local picks = {}
@@ -496,27 +548,26 @@ function M.run(o)
       for _, i in ipairs(probe) do
         if checkCanceled() then break end
         local t0 = now()
-        local clean, report, reason = fetch(o.items[i])
+        local clean, report, reason, calls, waitOutcome = fetch(o.items[i])
         local took = now() - t0
         probeSeconds = probeSeconds + took
         cache[i] = { clean = clean, report = report, reason = reason }
         if clean then probeOk = probeOk + 1 else count(reason) end
-        log.info('probe photo %d: %s %.2fs %s', i,
-          report and string.format('%dx%d', report.width, report.height) or '-', took, tostring(reason or 'ok'))
+        countWait(waitOutcome)
+        -- "送信の記録"（1.2.1）用: 最初の3枚の {w,h,seconds,reason}（サーバーは3件まで受ける。
+        -- PROBE_COUNT も3なので、probe はこの3枚そのもの）
+        st.probeSamples[#st.probeSamples + 1] = {
+          w = report and report.width, h = report and report.height, seconds = took, reason = reason or 'ok',
+        }
+        log.info('probe photo %d: %s %.2fs %s calls=%d wait=%s', i,
+          report and string.format('%dx%d', report.width, report.height) or '-', took,
+          tostring(reason or 'ok'), calls or 0, tostring(waitOutcome))
       end
-      local usable = #probe == 0 or (probeOk * 2 > #probe)
       local avg = #probe > 0 and (probeSeconds / #probe) or 0
-      if usable and avg >= PROBE_SLOW then
-        -- previews have to be rendered first (standard preview size below ~2048, or none built):
-        -- no faster than exporting, and it fills the preview cache
-        usable = false
-        count('slow')
-        log.info('speed-first: previews are rendered on demand here (%.2fs per photo): exporting everything', avg)
-      end
-      if not usable then
-        st.fastDisabled = true
-        log.info('speed-first: previews not usable here (%d of %d probes ok, %.2fs per probe): exporting everything',
-          probeOk, #probe, avg)
+      if #probe > 0 and avg >= PROBE_SLOW then
+        -- previews have to be rendered first (standard preview size below ~2048, or none
+        -- built): no faster than exporting. Diagnostic only now — each photo is still tried.
+        log.info('speed-first: previews look rendered on demand here (%.2fs per probe)', avg)
       end
 
       -- 2. Per photo: use the preview when it is good, export when it is not.
@@ -524,18 +575,18 @@ function M.run(o)
       for i, item in ipairs(o.items) do
         if checkCanceled() then break end
         local clean, report, reason
-        if usable then
-          local c = cache[i]
-          if c then
-            clean, report, reason = c.clean, c.report, c.reason
-          elseif failuresInRow < PREVIEW_GIVE_UP then
-            clean, report, reason = fetch(item)
-            if not clean then count(reason) end
-          else
-            reason = 'gave-up'
-          end
-          if clean then failuresInRow = 0 else failuresInRow = failuresInRow + 1 end
+        local c = cache[i]
+        if c then
+          clean, report, reason = c.clean, c.report, c.reason
+        elseif failuresInRow < PREVIEW_GIVE_UP then
+          local waitOutcome
+          clean, report, reason, _, waitOutcome = fetch(item)
+          if not clean then count(reason) end
+          countWait(waitOutcome)
+        else
+          reason = 'gave-up'
         end
+        if clean then failuresInRow = 0 else failuresInRow = failuresInRow + 1 end
 
         if clean then
           st.previewOk = st.previewOk + 1
@@ -552,6 +603,9 @@ function M.run(o)
           toExport[#toExport + 1] = item.photo
         end
       end
+      -- Only when truly nothing could use a preview does the result say so (used by
+      -- timingText below); previously this was decided up front from the probe alone.
+      st.fastDisabled = st.previewOk == 0 and st.previewFallback > 0
     else
       for _, item in ipairs(o.items) do toExport[#toExport + 1] = item.photo end
     end
@@ -963,6 +1017,14 @@ function M.run(o)
     longMin = st.longMin, longMax = st.longMax,
     avgKB = st.sentCount > 0 and (st.sentBytes / st.sentCount / 1024) or 0,
     thumbSent = st.thumbSent, thumbFailed = st.thumbFailed,
+    -- exposed for lib/report.lua's "送信の記録" (1.2.1) only; purely additive — nothing above
+    -- reads these, the log lines below still use st.* directly as before.
+    uploadSeconds = st.uploadSeconds, uploadCalls = st.uploadCalls,
+    sipsSeconds = st.sipsSeconds,
+    thumbPutSeconds = st.thumbPutSeconds, thumbPutCalls = st.thumbPutCalls,
+    sentBytes = st.sentBytes, thumbBytes = st.thumbBytes,
+    failedStatus = st.failedStatus,
+    waitOutcomes = st.waitOutcomes,
   }
   local removedParts = {}
   for label, n in pairs(st.removed) do removedParts[#removedParts + 1] = label .. '=' .. n end
@@ -1015,6 +1077,7 @@ function M.run(o)
     manifestError = (not finished) and st.manifestError or nil,
     timings = timings,
     usedNames = usedList,
+    probe = st.probeSamples, -- "送信の記録"（1.2.1）: first/middle/last, {w,h,seconds,reason}
   }
 end
 

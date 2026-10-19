@@ -425,6 +425,16 @@ function M.deleteGallery(apiKey, sid)
   return request('DELETE', '/galleries/' .. text.urlEncodeSegment(sid), apiKey)
 end
 
+--- "送信の記録" (1.2.1, opt-in — see lib/report.lua): one small, anonymous performance/error
+--- report. Never retried on failure (lib/report.lua is the only caller, and it already swallows
+--- any error): a lost report is not worth slowing anything down or being told about.
+function M.sendReport(apiKey, body)
+  return request('POST', '/integration/report', apiKey, {
+    body = json.encode(body),
+    contentType = 'application/json',
+  })
+end
+
 function M.getSelections(apiKey, sid)
   return withRetry(function()
     return request('GET', '/galleries/' .. text.urlEncodeSegment(sid) .. '/selections', apiKey)
