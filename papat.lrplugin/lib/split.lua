@@ -1,7 +1,13 @@
 --[[
   lib/split.lua — decide whether a gallery is too big for one, and where to cut it
 
-  Decided 2026-10-15: a gallery of more than 888 photos is sent as several galleries instead.
+  2026-10-15: a gallery of more than 888 photos was sent as several galleries instead.
+  Decided 2026-10-20: one gallery is 88 yen regardless of size up to the server's own limit
+  (1,000 photos), so splitting only happens when the selection does not fit in one gallery at
+  all — the trigger moved to 1,000, and the target cut size to about 800 (so a 2-way split
+  still leaves two galleries that are each comfortably over the free size and under the
+  per-gallery price's photo ceiling).
+
   The cut point comes from the same groups lib/similarity.lua / lib/grouping.lua compute
   (never from counting photos alone), so a sub-gallery never splits mid-scene when a
   reasonable place to cut exists nearby. All values below are provisional; pure module, no
@@ -14,13 +20,11 @@
   were its own selection — lib/split.lua only ever answers "how many, how big".
 ]]
 
-local grouping = dofile(_PLUGIN.path .. '/lib/grouping.lua')
-
 local M = {}
 
-M.TRIGGER = 888    -- split only once the selection is larger than this
-M.LOWER = 750      -- the first range to look for a cut in, counted from this segment's start
-M.TARGET = 888     -- the count a cut is chosen to be closest to
+M.TRIGGER = 1000   -- split only once the selection is larger than this (2026-10-20: was 888)
+M.LOWER = 760      -- the first range to look for a cut in, counted from this segment's start
+M.TARGET = 800     -- the count a cut is chosen to be closest to (2026-10-20: was 888)
 M.MIN_LAST = 100   -- a last segment smaller than this is folded into the one before it instead
 
 --- The position (1-based, between photo k and k+1) in [lo, hi] closest to M.TARGET where
@@ -42,29 +46,16 @@ local function boundaryClosest(groups, n, lo, hi)
   return best
 end
 
---- The position in [lo, hi] with the largest gap between two (both dated) consecutive
---- capture times. nil when none of them have two consecutive dated photos to compare.
-local function largestGapCut(datetimes, n, lo, hi)
-  lo, hi = math.max(1, lo), math.min(n - 1, hi)
-  if lo > hi then return nil end
-  local best, bestGap
-  for k = lo, hi do
-    local ta = grouping.wallSeconds(datetimes[k])
-    local tb = grouping.wallSeconds(datetimes[k + 1])
-    if ta and tb then
-      local gap = tb - ta
-      if not bestGap or gap > bestGap then best, bestGap = k, gap end
-    end
-  end
-  return best
-end
-
 --- Where to cut a run of `n` photos (n > M.TRIGGER) that must be split at least once more.
---- `groups`/`datetimes` are this segment's own slice (1-based, length n): the combined
---- (similarity-refined, else time-only) group number per photo (0 = no capture time), and the
---- capture-time string per photo. `groups` may be nil (no grouping could be computed at all).
+--- `groups` is this segment's own slice (1-based, length n): the combined (similarity-refined,
+--- else time-only) group number per photo (0 = no capture time). May be nil (no grouping could
+--- be computed at all). `datetimes` is accepted for the caller's convenience (lib/plan already
+--- slices it alongside `groups`) but no longer used here: 2026-10-20's decision (§10.5) drops
+--- the "largest gap between capture times" fallback — once time-based grouping already cuts at
+--- the gaps between groups, a separate gap search over the same timestamps has nothing left to
+--- find that step 1/2 above would not have found already.
 --- @return number cut  1 <= cut < n (a photo count: first `cut` photos go to this gallery)
-function M.findCut(n, groups, datetimes, maxPhotos)
+function M.findCut(n, groups, datetimes, maxPhotos) -- luacheck: ignore datetimes
   -- every candidate stays within maxPhotos, even in the (unexpected) case that it is below
   -- M.TARGET: CreateGallery.lua still checks the final plan against it before using it.
   local upperTarget = math.min(M.TARGET, maxPhotos)
@@ -72,10 +63,7 @@ function M.findCut(n, groups, datetimes, maxPhotos)
     or boundaryClosest(groups, n, upperTarget, math.min(maxPhotos, n - 1))
   if cut then return cut end
 
-  cut = largestGapCut(datetimes, n, M.LOWER, math.min(maxPhotos, n - 1))
-  if cut then return cut end
-
-  return math.min(upperTarget, n - 1) -- no capture time anywhere: a fixed cut, in the given order
+  return math.min(upperTarget, n - 1) -- no boundary anywhere in range: a fixed cut at ~800
 end
 
 --- A last segment under M.MIN_LAST photos is not worth a gallery of its own: folded into the

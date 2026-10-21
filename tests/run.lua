@@ -33,16 +33,28 @@ eq(sha256.hex(string.rep('a', 64)), 'ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43
 eq(sha256.hex('パスコード'), 'f0970bf19cafcb72b083d7e75ac99761795d4c5cdc983b5cf37bdfc9687d27f2', 'sha256 utf8')
 eq(sha256.hex('ABC234'), '8c640c4e71f90160b2b3615af86739e6b15ddc877ae79e18aada753565f756c4', 'sha256 passcode')
 
--- text: price ---------------------------------------------------------------
-eq(text.priceYen(1, 7), 88, 'price 1 photo 7d')
+-- text: price (decided 2026-10-20: 1 ギャラリー
+-- 88 円・88 枚までは 8 円・延長 +88 円。枚数で額が増える仕組みは廃止） ------------------------
+eq(text.priceYen(1, 7), 8, 'price 1 photo 7d (88 枚までは 8 円)')
+eq(text.priceYen(88, 7), 8, 'price exactly 88 photos 7d (8 円の上限)')
+eq(text.priceYen(89, 7), 88, 'price 89 photos 7d (89 枚目から 88 円)')
 eq(text.priceYen(300, 7), 88, 'price 300 photos 7d')
-eq(text.priceYen(301, 7), 176, 'price 301 photos 7d')
-eq(text.priceYen(300, 14), 176, 'price 300 photos 14d')
-eq(text.priceYen(900, 14), 352, 'price 900 photos 14d')
+eq(text.priceYen(1000, 7), 88, 'price 1,000 photos 7d (サーバーの上限でも 88 円)')
+eq(text.priceYen(9, 14), 96, 'price 9 photos 14d (8 + 88)')
+eq(text.priceYen(300, 14), 176, 'price 300 photos 14d (88 + 88)')
+eq(text.priceYen(900, 14), 176, 'price 900 photos 14d (枚数では増えない)')
 eq(text.priceYenSplit({ 750, 138 }, 7), text.priceYen(750, 7) + text.priceYen(138, 7), 'priceYenSplit: sums each gallery')
-eq(text.priceLineYen(176, nil), '目安 176 円（税込）', 'priceLineYen: no free count')
+eq(text.priceYenSplit({ 800, 800, 400 }, 7), 88 * 3, 'priceYenSplit: 2,000 枚を分けた 3 ギャラリー分（264円）')
+eq(text.priceLineYen(88, nil), '目安 88 円（税込）', 'priceLineYen: no free count')
 eq(text.priceLineYen(88, 0), '目安 88 円（税込）　※無料の残りはありません', 'priceLineYen: free exhausted')
 eq(text.priceLineYen(88, 3), '目安 88 円（税込）　※無料の残り 3 ギャラリー', 'priceLineYen: free remaining')
+-- 無料の残りがあるときは、写真の分を 0 円で出す（延長は無料の 8 本の中でも +88 円のまま）
+eq(text.priceLine(10, 7, 5), '目安 0 円（税込）　※無料の残り 5 ギャラリー', 'priceLine: free remaining -> photos are 0 yen')
+eq(text.priceLine(1000, 7, 1), '目安 0 円（税込）　※無料の残り 1 ギャラリー', 'priceLine: free remaining -> 0 yen even at 1,000 photos')
+eq(text.priceLine(10, 14, 5), '目安 88 円（税込）　※無料の残り 5 ギャラリー', 'priceLine: free remaining, 14 days -> extension still +88 yen')
+eq(text.priceLine(10, 7, 0), '目安 8 円（税込）　※無料の残りはありません', 'priceLine: no free remaining -> the real price')
+-- 2,000 枚を分けて、無料が 2 本残っていれば、1・2 本目が 0 円、3 本目が 88 円
+eq(text.priceYenSplit({ 800, 800, 400 }, 7, 2), 88, 'priceYenSplit: free covers the first 2 of 3 segments')
 eq(text.splitLine({ 750, 138 }), '888 枚を 2 つのギャラリーに分けて送ります（750枚・138枚）', 'splitLine: two galleries')
 eq(text.splitLine({ 888, 888, 224 }), '2000 枚を 3 つのギャラリーに分けて送ります（888枚・888枚・224枚）', 'splitLine: three galleries')
 
@@ -59,6 +71,16 @@ eq(text.jaDate(2026, 10, 7), '2026年10月7日', 'jaDate')
 eq(text.daysUntil('2026-10-17T01:00:00.000Z', text.isoToEpoch('2026-10-10T01:00:00Z')), 7, 'daysUntil 7')
 eq(text.daysUntil('2026-10-24T01:00:00.000Z', text.isoToEpoch('2026-10-10T01:00:00Z')), 14, 'daysUntil 14')
 eq(text.isoToEpoch('garbage'), nil, 'isoToEpoch garbage')
+
+-- 2026-10-20 (pricing-plans-v0.1.md §10.6, B54): the expiry line needs the day of week and the
+-- time — 10/27 (the pricing doc's own worked example, created 2026-10-20 + 7 days) is a Tuesday
+eq(text.jaDateTimeWithWeekday('2026-10-27T02:00:00Z', 9 * 3600), '10月27日（火）11:00',
+  'jaDateTimeWithWeekday: the pricing doc\'s own example (8 日目の 11:00 JST)')
+eq(text.expireText('2026-10-27T02:00:00Z', 9 * 3600), '10月27日（火）11:00まで', 'expireText: appends まで')
+eq(text.jaDateTimeWithWeekday('2026-11-03T02:00:00Z', 9 * 3600), '11月3日（火）11:00', 'jaDateTimeWithWeekday: 14泊15日 の例')
+eq(text.jaDateTimeWithWeekday('garbage', 9 * 3600), nil, 'jaDateTimeWithWeekday: unparsable = nil')
+eq(text.expireText('garbage', 9 * 3600), '', 'expireText: unparsable = empty string (no line at all)')
+eq(text.expireText(nil, 9 * 3600), '', 'expireText: nil = empty string')
 
 -- text: strings -------------------------------------------------------------
 eq(text.urlEncodeSegment('DSC 0123 写真.jpg'), 'DSC%200123%20%E5%86%99%E7%9C%9F.jpg', 'urlencode')
@@ -80,16 +102,17 @@ eq(text.nameKey('\227\131\143\227\130\154.jpg'), '\227\131\145.jpg', 'nameKey co
 eq(text.nameKey('\227\130\166\227\130\153.jpg'), '\227\131\180.jpg', 'nameKey compose vu')
 
 local ann = text.announcement({ title = '春の撮影', url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', expireText = '10月17日まで' })
-eq(ann, '写真をお送りします。\n春の撮影\n\nURL: https://papat.app/t/x/s/y/\nパスコード: ABC234\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement layout')
+eq(ann, '写真をお送りします。\n春の撮影\n\nURL: https://papat.app/t/x/s/y/#p=ABC234\nパスコード: ABC234\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement layout')
 eq(ann:find('登録', 1, true), nil, 'announcement: no "登録は要りません"')
-eq(text.announcement({ url = 'u', passcode = 'p' }), '写真をお送りします。\n\nURL: u\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement without title/expiry')
+eq(text.announcement({ url = 'u', passcode = 'p' }), '写真をお送りします。\n\nURL: u#p=p\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'announcement without title/expiry')
 
 -- announcement: 1.2.0's auto-split (several URLs, "N/M：URL" per line; opts.urls wins over opts.url)
+-- 1.2.2: the URL line is {パスコード入りURL} by default, so each one also carries "#p=<passcode>"
 eq(text.announcement({ urls = { 'https://a/' }, passcode = 'p' }),
-  '写真をお送りします。\n\nURL: https://a/\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。',
+  '写真をお送りします。\n\nURL: https://a/#p=p\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。',
   'announcement: a single-entry urls behaves exactly like url')
 eq(text.announcement({ title = '春の撮影', urls = { 'https://a/', 'https://b/' }, passcode = 'ABC234', expireText = '10月17日まで' }),
-  '写真をお送りします。\n春の撮影\n\nURL: 1/2：https://a/\n2/2：https://b/\nパスコード: ABC234\n公開期限: 10月17日まで\n\n'
+  '写真をお送りします。\n春の撮影\n\nURL: 1/2：https://a/#p=ABC234\n2/2：https://b/#p=ABC234\nパスコード: ABC234\n公開期限: 10月17日まで\n\n'
     .. 'ブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。',
   'announcement: two URLs, one per line, each numbered')
 eq(text.announcement({ urls = { 'https://a/', 'https://b/', 'https://c/' } }):find('1/3：https://a/', 1, true) ~= nil
@@ -97,6 +120,38 @@ eq(text.announcement({ urls = { 'https://a/', 'https://b/', 'https://c/' } }):fi
   true, 'announcement: three URLs, all numbered out of 3')
 eq(text.announcement({ url = 'https://single/', urls = {}, passcode = 'p' }):find('https://single/', 1, true) ~= nil,
   true, 'announcement: an empty urls table falls back to url')
+
+-- 1.2.2: {パスコード入りURL} — a gallery URL with the passcode folded in (added 2026-10-20;
+-- https://papat.app/t/{tenant}/s/{sid}/#p={パスコード}; gallery-side support is separate work)
+eq(text.passcodeUrl('https://papat.app/t/x/s/y/', 'ABC234'), 'https://papat.app/t/x/s/y/#p=ABC234', 'passcodeUrl: basic')
+eq(text.passcodeUrl('https://papat.app/t/x/s/y/', 'a b&c'), 'https://papat.app/t/x/s/y/#p=a%20b%26c',
+  'passcodeUrl: the passcode is percent-encoded (a fragment, not a bare path segment)')
+eq(text.passcodeUrl('https://x/', nil), 'https://x/', 'passcodeUrl: no passcode = the bare URL, no "#p="')
+eq(text.passcodeUrl('https://x/', ''), 'https://x/', 'passcodeUrl: empty passcode = the bare URL, no "#p="')
+eq(text.passcodeUrl(nil, 'ABC234'), nil, 'passcodeUrl: no URL = nil, not "#p=" on its own')
+eq(text.PASSCODE_URL_KEY, 'p', 'passcodeUrl: the fragment key is "p" (subject to change)')
+
+-- a template that asks for {パスコード入りURL} explicitly gets the same value the default does
+-- (none of these name {パスコード} separately, so the missing-passcode fallback still appends
+-- its own line, same as a template that only names {URL} would — nothing new about that part)
+eq(text.announcement({ url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', template = 'どうぞ: {パスコード入りURL}' }),
+  'どうぞ: https://papat.app/t/x/s/y/#p=ABC234\nパスコード: ABC234', 'announcement: {パスコード入りURL} mark, own wording')
+eq(text.announcement({ url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', template = '{urlwithpasscode}' }),
+  '{urlwithpasscode}\n\nURL: https://papat.app/t/x/s/y/\nパスコード: ABC234',
+  'announcement: unknown mark name stays literal (not an alias) and the real URL/passcode still get appended')
+eq(text.announcement({ url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', template = '{passcodeurl}' }),
+  'https://papat.app/t/x/s/y/#p=ABC234\nパスコード: ABC234', 'announcement: the English mark name (lowercase) also works')
+-- a template using {パスコード入りURL} does not ALSO get a redundant plain "URL:" fallback line
+eq(text.announcement({ url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', template = '{パスコード入りURL}' })
+  :find('URL:', 1, true), nil, 'announcement: {パスコード入りURL} alone does not trigger the missing-URL fallback')
+-- a template with neither URL mark still gets the (plain) URL appended, as before
+eq(text.announcement({ url = 'https://papat.app/t/x/s/y/', passcode = 'ABC234', template = 'こんにちは。' }),
+  'こんにちは。\n\nURL: https://papat.app/t/x/s/y/\nパスコード: ABC234',
+  'announcement: the missing-URL fallback still uses the plain URL, not the passcode-embedded one')
+-- the split case: each numbered line carries its own gallery\'s passcode-embedded URL
+eq(text.announcement({ urls = { 'https://a/', 'https://b/' }, passcode = 'ABC234', template = '{パスコード入りURL}' }),
+  '1/2：https://a/#p=ABC234\n2/2：https://b/#p=ABC234\nパスコード: ABC234',
+  'announcement: {パスコード入りURL} numbers every gallery, split')
 eq(text.jaMonthDay(10, 7), '10月7日', 'jaMonthDay')
 eq(text.compareVersions('1.0.0', '1.0.1'), -1, 'version lt')
 eq(text.compareVersions('1.10.0', '1.9.9'), 1, 'version gt')
@@ -505,15 +560,16 @@ eq(plan[1].name, 'papat 採用 2026-10-10', 'flat plan: no title')
 -- Announcement template (1.1.0) --------------------------------------------------
 do
   local url, pass = 'https://papat.app/t/x/s/y/', 'ABC234'
+  local urlWithPasscode = url .. '#p=' .. pass -- 1.2.2: the default template's URL line now
   local function ann(template, extra)
     local o = { title = '春の撮影', url = url, passcode = pass, expireText = '10月17日まで', template = template }
     for k, v in pairs(extra or {}) do o[k] = v end
     return text.announcement(o)
   end
-  -- the default template gives the old text, byte for byte
-  eq(ann(nil), '写真をお送りします。\n春の撮影\n\nURL: ' .. url .. '\nパスコード: ' .. pass
-    .. '\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: default = the old text')
-  eq(ann(nil, { title = '', expireText = '' }), '写真をお送りします。\n\nURL: ' .. url .. '\nパスコード: ' .. pass
+  -- the default template: URL line carries the passcode folded in (1.2.2)
+  eq(ann(nil), '写真をお送りします。\n春の撮影\n\nURL: ' .. urlWithPasscode .. '\nパスコード: ' .. pass
+    .. '\n公開期限: 10月17日まで\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: default = the old text, URL with the passcode folded in')
+  eq(ann(nil, { title = '', expireText = '' }), '写真をお送りします。\n\nURL: ' .. urlWithPasscode .. '\nパスコード: ' .. pass
     .. '\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: lines with empty marks are left out')
   -- own wording
   eq(ann('{題} の写真です。\n{URL}\nパスコードは {パスコード} です（{期限}）。'),
@@ -531,7 +587,7 @@ do
   eq(ann(string.rep('あ', 2001)), ann(nil), 'template: too long = default')
   eq(ann('{題}\r\n{URL}\r{パスコード}'), '春の撮影\n' .. url .. '\n' .. pass, 'template: Windows / old Mac line ends')
   eq(text.announcement({ url = 'u', passcode = 'p' }),
-    '写真をお送りします。\n\nURL: u\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: no opts beyond url/passcode')
+    '写真をお送りします。\n\nURL: u#p=p\nパスコード: p\n\nブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。', 'template: no opts beyond url/passcode')
 
   -- an edited announcement becomes a template again
   local edited = '春の撮影です。\n春の撮影\n' .. url .. '\nパスコード ABC234\n10月17日まで開けます。'
@@ -559,8 +615,10 @@ do
   eq(tpl2, text.DEFAULT_ANNOUNCEMENT_TEMPLATE, 'fromAnnouncement: two URLs fold back to exactly the default template')
   eq(tpl2:find(url1, 1, true), nil, 'fromAnnouncement: the 1st URL does not survive')
   eq(tpl2:find(url2, 1, true), nil, 'fromAnnouncement: the 2nd URL does not survive (this was the bug)')
-  eq(tpl2:find('{URL}', 1, true) ~= nil, true, 'fromAnnouncement: exactly one {URL} mark is left')
-  eq(select(2, tpl2:gsub('{URL}', '')), 1, 'fromAnnouncement: {URL} appears exactly once, not once per gallery')
+  eq(tpl2:find('{パスコード入りURL}', 1, true) ~= nil, true, 'fromAnnouncement: exactly one {パスコード入りURL} mark is left')
+  eq(select(2, tpl2:gsub('{パスコード入りURL}', '')), 1,
+    'fromAnnouncement: {パスコード入りURL} appears exactly once, not once per gallery')
+  eq(tpl2:find('{URL}', 1, true), nil, 'fromAnnouncement: the bare {URL} mark is not also left behind')
 
   -- three galleries: same, and it still renders correctly afterwards (round-trip)
   local ann3 = text.announcement({ title = '夏の撮影', urls = { url1, url2, url3 }, passcode = 'XYZ999', expireText = '11月1日まで' })
@@ -571,6 +629,11 @@ do
   local rendered3 = text.announcement({ title = '次の撮影', url = 'https://papat.app/t/z/s/9/', passcode = 'NEXT01', expireText = '12月1日まで', template = tpl3 })
   eq(rendered3:find(url1, 1, true), nil, 'fromAnnouncement: the saved template renders the NEXT client\'s own URL, not the old ones')
   eq(rendered3:find('https://papat.app/t/z/s/9/', 1, true) ~= nil, true, 'fromAnnouncement: … and does carry the new URL')
+  -- 1.2.2: the URL mark is now {パスコード入りURL} — a saved template must not carry an OLD
+  -- client's passcode forward either, and must fold in the NEXT client's own passcode
+  eq(rendered3:find('XYZ999', 1, true), nil, 'fromAnnouncement: the old passcode does not survive into the next client\'s announcement')
+  eq(rendered3:find('https://papat.app/t/z/s/9/#p=NEXT01', 1, true) ~= nil, true,
+    'fromAnnouncement: … and the new URL carries the NEW client\'s own passcode')
 
   -- a single gallery (urls with one entry) behaves exactly like the plain url= case (regression)
   local ann1 = text.announcement({ title = '春の撮影', urls = { url1 }, passcode = 'ABC234', expireText = '10月17日まで' })
@@ -636,10 +699,10 @@ eq(text.parseFreeRemaining(nil), nil, 'free: missing')
 eq(text.parseFreeRemaining('many'), nil, 'free: not a number')
 eq(text.parseFreeRemaining(-1), nil, 'free: negative')
 eq(text.parseFreeRemaining(2.9), 2, 'free: whole galleries')
-eq(text.priceLine(9, 7, 5), '目安 88 円（税込）　※無料の残り 5 ギャラリー', 'priceLine: free remaining')
-eq(text.priceLine(9, 14, 0), '目安 176 円（税込）　※無料の残りはありません', 'priceLine: none left')
-eq(text.priceLine(9, 7, nil), '目安 88 円（税込）', 'priceLine: unknown = the free allowance is not mentioned')
-eq(text.priceLine(301, 7, 8), '目安 176 円（税込）　※無料の残り 8 ギャラリー', 'priceLine: units')
+eq(text.priceLine(9, 7, 5), '目安 0 円（税込）　※無料の残り 5 ギャラリー', 'priceLine: free remaining -> 0 yen')
+eq(text.priceLine(9, 14, 0), '目安 96 円（税込）　※無料の残りはありません', 'priceLine: none left')
+eq(text.priceLine(9, 7, nil), '目安 8 円（税込）', 'priceLine: unknown = the free allowance is not mentioned')
+eq(text.priceLine(301, 7, 8), '目安 0 円（税込）　※無料の残り 8 ギャラリー', 'priceLine: free remaining -> 0 yen even for a large gallery')
 
 -- Dialog text layout (fixed height_in_lines must not cut the text) -------------
 eq(text.displayUnits('あいう'), 3, 'displayUnits: Japanese counts 1 per character')
@@ -808,91 +871,92 @@ do
   end
 end
 
--- split: where to cut a gallery larger than 888 photos (2026-10-15 の決定). Pure; no LrC.
+-- split: where to cut a gallery larger than 1,000 photos (2026-10-20, pricing-plans-v0.1.md
+-- 1 ギャラリー 88 円なので、1,000 枚までは分けない;
+-- splitting only when it does not fit in one gallery at all, cutting at ~800 so each half is
+-- comfortably its own gallery). Pure; no LrC.
 do
   local split = load('split')
-  local grouping = load('grouping')
 
-  eq(split.TRIGGER, 888, 'split: TRIGGER pinned')
-  eq(split.LOWER, 750, 'split: LOWER pinned')
-  eq(split.TARGET, 888, 'split: TARGET pinned')
+  eq(split.TRIGGER, 1000, 'split: TRIGGER pinned')
+  eq(split.LOWER, 760, 'split: LOWER pinned')
+  eq(split.TARGET, 800, 'split: TARGET pinned')
   eq(split.MIN_LAST, 100, 'split: MIN_LAST pinned')
 
-  -- no split below/at the trigger
   local function eqArr(actual, expected, label)
     local ok = #actual == #expected
     if ok then for i = 1, #expected do if actual[i] ~= expected[i] then ok = false end end end
     eq(ok, true, label .. ' (got [' .. table.concat(actual, ',') .. '])')
   end
-  eqArr(split.plan(1, nil, { '' }, 1000), { 1 }, 'split: 1 photo never splits')
-  eqArr(split.plan(888, nil, {}, 1000), { 888 }, 'split: exactly 888 does not split')
 
-  -- a group boundary inside [750,888]: used as is, closest to 888 wins among several
+  -- no split below/at the trigger
+  eqArr(split.plan(1, nil, { '' }, 1000), { 1 }, 'split: 1 photo never splits')
+  eqArr(split.plan(900, nil, {}, 1000), { 900 }, 'split: 900 photos does not split (was 176 yen at TRIGGER 888; now one gallery)')
+  eqArr(split.plan(1000, nil, {}, 1000), { 1000 }, 'split: exactly 1,000 does not split')
+
+  -- two worked examples
+  eqArr(split.plan(2000, nil, {}, 1000), { 800, 800, 400 }, 'split: 2,000 -> 800/800/400')
+  eqArr(split.plan(2500, nil, {}, 1000), { 800, 800, 900 }, 'split: 2,500 -> 800/800/900 (§10.5 の例の表)')
+
+  -- a group boundary inside [760,800]: used as is, closest to 800 wins among several
   do
-    local n = 1000
+    local n = 1200
     local groups = {}
     for i = 1, n do groups[i] = 1 end
-    for i = 801, n do groups[i] = 2 end -- boundary at 800 (dist 88)
-    for i = 851, n do groups[i] = 3 end -- boundary at 850 (dist 38): closer, should win
-    local dts = {}
-    for i = 1, n do dts[i] = '' end
-    eqArr(split.plan(n, groups, dts, 1000), { 850, 150 }, 'split: closest-of-several boundary in [750,888]')
+    for i = 781, n do groups[i] = 2 end -- boundary at 780 (dist 20)
+    for i = 791, n do groups[i] = 3 end -- boundary at 790 (dist 10): closer, should win
+    eqArr(split.plan(n, groups, {}, 1000), { 790, 410 }, 'split: closest-of-several boundary in [760,800]')
   end
 
-  -- no boundary in [750,888], one in [888,1000]: used, even though it leaves a small remainder
-  -- small enough to trigger the merge-back (remainder 50 < MIN_LAST, combined 1000 <= max)
+  -- no boundary in [760,800], one in [800,1000]: used
   do
-    local n = 1000
+    local n = 1100
     local groups = {}
     for i = 1, n do groups[i] = (i <= 950) and 1 or 2 end -- boundary only at 950
-    local dts = {}
-    for i = 1, n do dts[i] = '' end
-    eqArr(split.plan(n, groups, dts, 1000), { 1000 }, 'split: a far boundary that leaves <100 merges back to one')
+    eqArr(split.plan(n, groups, {}, 1000), { 950, 150 }, 'split: no boundary in [760,800] -> the one in [800,1000] is used')
   end
 
-  -- same, but the remainder is >= MIN_LAST: no merge
+  -- a remainder of exactly MIN_LAST is kept, not merged
   do
-    local n = 1000
+    local n = 1100
     local groups = {}
-    for i = 1, n do groups[i] = (i <= 900) and 1 or 2 end -- boundary at 900, remainder 100
-    local dts = {}
-    for i = 1, n do dts[i] = '' end
-    eqArr(split.plan(n, groups, dts, 1000), { 900, 100 }, 'split: a remainder of exactly MIN_LAST is kept')
+    for i = 1, n do groups[i] = (i <= 1000) and 1 or 2 end -- boundary at 1000, remainder 100
+    eqArr(split.plan(n, groups, {}, 1000), { 1000, 100 }, 'split: a remainder of exactly MIN_LAST is kept')
   end
 
-  -- no grouping at all (nil): falls back to the largest capture-time gap in range
+  -- a remainder under MIN_LAST merges back — only possible when the server's maxPhotos allows
+  -- the merged size (here 1,000+50, under a server max of 1,200): with maxPhotos == TRIGGER
+  -- (the usual case), merging back would always exceed maxPhotos by definition, so this can
+  -- only happen when the server reports more room than the plug-in's own TRIGGER assumes.
   do
-    local n = 1000
+    local n, maxPhotos = 1050, 1200
+    local groups = {}
+    for i = 1, n do groups[i] = (i <= 960) and 1 or 2 end -- boundary at 960, remainder 90 (<100)
+    eqArr(split.plan(n, groups, {}, maxPhotos), { 1050 }, 'split: a remainder under MIN_LAST merges back when the server allows the combined size')
+  end
+
+  -- 760〜800 に境目が無く、800〜1,000 の 830 にある場合
+  do
+    local n = 1200
+    local groups = {}
+    for i = 1, n do groups[i] = (i <= 830) and 1 or 2 end -- the only boundary is at 830
+    eqArr(split.plan(n, groups, {}, 1000), { 830, 370 }, 'split: no boundary in [760,800], one at 830 -> cut at 830')
+  end
+
+  -- グループが働かない（nil）場合は 800 で切る。datetimes はもう見ない（largestGapCut は
+  -- 2026-10-20 に外した — 時刻のグループがあれば、その境目はすでに上の手順で見つかっている）
+  do
+    local n = 1200
+    eqArr(split.plan(n, nil, {}, 1000), { 800, 400 }, 'split: no grouping at all -> a flat cut at 800')
+    -- datetimes are accepted but ignored: the same input with "interesting" timestamps still
+    -- just cuts at 800, confirming the largest-gap fallback is gone
     local dts = {}
     for i = 1, n do dts[i] = os.date('!%Y-%m-%dT%H:%M:%S', 1790000000 + i * 10) end
-    -- widen the gap right after position 820 well beyond its neighbours
-    local t820 = grouping.wallSeconds(dts[820])
-    dts[821] = os.date('!%Y-%m-%dT%H:%M:%S', t820 + 9000)
-    for i = 822, n do dts[i] = os.date('!%Y-%m-%dT%H:%M:%S', t820 + 9000 + (i - 821) * 10) end
-    eqArr(split.plan(n, nil, dts, 1000), { 820, 180 }, 'split: no groups -> largest capture-time gap in range')
+    eqArr(split.plan(n, nil, dts, 1000), { 800, 400 }, 'split: datetimes no longer change the outcome')
   end
 
-  -- no grouping and no capture time anywhere: a fixed cut at 888
-  do
-    local n = 1000
-    local dts = {}
-    for i = 1, n do dts[i] = '' end
-    eqArr(split.plan(n, nil, dts, 1000), { 888, 112 }, 'split: nothing to go on -> fixed cut at 888')
-  end
-
-  -- more than one cut needed (selection far larger than maxPhotos): repeats the same rule
-  do
-    local n = 2500
-    local groups = {}
-    for i = 1, n do groups[i] = 1 end
-    for i = 821, n do groups[i] = 2 end   -- boundary at 820 (inside [750,888] of segment 1)
-    for i = 821 + 830, n do groups[i] = 3 end -- a boundary 830 into segment 2 (inside its [750,888])
-    local dts = {}
-    for i = 1, n do dts[i] = '' end
-    eqArr(split.plan(n, groups, dts, 1000), { 820, 830, 850 }, 'split: a large selection splits more than once')
-  end
-
-  -- a merge that would exceed maxPhotos never happens
+  -- a merge that would exceed maxPhotos never happens (mergeSmallTail directly; unaffected by
+  -- the TRIGGER/TARGET change — pure function of segment sizes)
   do
     local segs = split.mergeSmallTail({ 900, 50 }, 940)
     eqArr(segs, { 900, 50 }, 'split: mergeSmallTail refuses when the combined size is too big')
@@ -903,6 +967,7 @@ do
   end
 
   -- renumbering: each segment's display groups restart at 1, 0 (no capture time) stays 0
+  -- (unaffected by the TRIGGER/TARGET change)
   do
     local groups = { 1, 1, 2, 2, 3, 0, 0, 5, 5 }
     eqArr(split.renumberSegment(groups, 1, 5), { 1, 1, 2, 2, 3 }, 'split: renumberSegment, first segment')
@@ -911,27 +976,27 @@ do
     eqArr(split.renumberSegment(nil, 1, 3), { 0, 0, 0 }, 'split: renumberSegment with no groups at all')
   end
 
-  -- findCut directly: an exact-888 boundary needs no fallback
+  -- findCut directly: an exact-800 boundary needs no fallback
   do
-    local n = 1000
+    local n = 1200
     local groups = {}
-    for i = 1, n do groups[i] = (i <= 888) and 1 or 2 end
-    eq(split.findCut(n, groups, {}, 1000), 888, 'split: findCut, boundary exactly at the target')
+    for i = 1, n do groups[i] = (i <= 800) and 1 or 2 end
+    eq(split.findCut(n, groups, {}, 1000), 800, 'split: findCut, boundary exactly at the target')
 
-    -- two boundaries in the same [750,888] range: the closer of the two wins
+    -- two boundaries in the same [760,800] range: the closer of the two wins
     groups = {}
     for i = 1, n do groups[i] = 1 end
-    for i = 861, n do groups[i] = 2 end -- boundary at 860 (dist 28)
-    for i = 871, n do groups[i] = 3 end -- boundary at 870 (dist 18): closer, should win
-    eq(split.findCut(n, groups, {}, 1000), 870, 'split: findCut, the closer of two in the same range wins')
+    for i = 771, n do groups[i] = 2 end -- boundary at 770 (dist 30)
+    for i = 781, n do groups[i] = 3 end -- boundary at 780 (dist 20): closer, should win
+    eq(split.findCut(n, groups, {}, 1000), 780, 'split: findCut, the closer of two in the same range wins')
 
-    -- [750,888] takes strict priority over [888,1000], even when [888,1000] has a closer one
+    -- [760,800] takes strict priority over [800,1000], even when [800,1000] has a closer one
     groups = {}
     for i = 1, n do groups[i] = 1 end
-    for i = 761, n do groups[i] = 2 end -- boundary at 760 (dist 128), only candidate in [750,888]
-    for i = 901, n do groups[i] = 3 end -- boundary at 900 (dist 12): closer overall, but out of range
-    eq(split.findCut(n, groups, {}, 1000), 760,
-      'split: findCut, [750,888] wins over a closer boundary that only falls in [888,1000]')
+    for i = 766, n do groups[i] = 2 end -- boundary at 765 (dist 35), only candidate in [760,800]
+    for i = 811, n do groups[i] = 3 end -- boundary at 810 (dist 10): closer overall, but out of range
+    eq(split.findCut(n, groups, {}, 1000), 765,
+      'split: findCut, [760,800] wins over a closer boundary that only falls in [800,1000]')
   end
 end
 

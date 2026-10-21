@@ -356,6 +356,17 @@ function M.listGalleries(apiKey)
   return res
 end
 
+--- expected_photos (pricing-plans-v0.1.md §10.4, optional): how many photos this one gallery
+--- will be sent, so the server can check the monthly limit and whether a card is needed
+--- before anything is sent, instead of only finding out partway through. 0..1,000 only — an
+--- out-of-range or missing value is simply left off (the server already treats it as optional:
+--- an older plug-in or the CLI never sends it).
+local function expectedPhotosField(n)
+  n = tonumber(n)
+  if not n or n ~= n or n < 0 or n > 1000 then return nil end
+  return math.floor(n)
+end
+
 function M.createGallery(apiKey, args)
   -- passcode_hash is required; `passcode` (plain, over TLS) lets the server keep an
   -- encrypted copy so the photographer can read it again in the dashboard. The
@@ -366,6 +377,7 @@ function M.createGallery(apiKey, args)
     passcode_hash = args.passcodeHash,
     passcode = args.passcode,
     key_color = args.keyColor, -- nil = papat's default color
+    expected_photos = expectedPhotosField(args.expectedPhotos),
   })
   -- the same Idempotency-Key makes a repeated POST safe
   return withRetry(function()

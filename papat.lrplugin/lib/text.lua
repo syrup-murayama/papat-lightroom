@@ -6,27 +6,36 @@
 local M = {}
 
 -- ---------------------------------------------------------------------------
--- Pricing (tax included): 88 yen per unit.
---   unit = up to 300 photos x 7 days
---   +1 unit per further 300 photos, +1 unit for the 7-day extension (14 days)
+-- Pricing (tax included). Decided 2026-10-20: one gallery is 88 yen (up to 1,000 photos), or
+-- 8 yen when it has 88 photos or fewer (even 0).
+-- Extending to 14 days is +88 yen either way. No more "300 photos = 1 unit, +1 unit per
+-- further 300" — a gallery's price no longer grows with its photo count past 88.
 -- The server is the source of truth; this is only the estimate shown in the dialog.
 -- ---------------------------------------------------------------------------
 
-M.UNIT_YEN = 88
-M.PHOTOS_PER_UNIT = 300
+M.GALLERY_YEN = 88    -- one gallery, any size up to M.MAX_PHOTOS
+M.SMALL_PHOTOS = 88   -- at or under this many photos, the price is M.SMALL_YEN instead
+M.SMALL_YEN = 8
+M.EXTENSION_YEN = 88  -- +88 yen for 14 days instead of 7 (any gallery size, even free ones)
 M.MAX_PHOTOS = 1000 -- what is assumed until the server says otherwise (status: max_photos);
-                     -- 1.2.0's auto-split keeps a single gallery to this many (decided 2026-10-15)
+                     -- the auto-split (lib/split.lua) keeps a single gallery to this many
 M.MIN_PASSCODE_LENGTH = 4
 M.MAX_PASSCODE_LENGTH = 64
 
-function M.priceUnits(photoCount, days)
-  local blocks = math.max(1, math.ceil((photoCount or 0) / M.PHOTOS_PER_UNIT))
-  if days and days > 7 then blocks = blocks + 1 end
-  return blocks
+--- The full (non-free) price for one gallery of `photoCount` photos over `days`.
+function M.priceYen(photoCount, days)
+  local base = ((photoCount or 0) <= M.SMALL_PHOTOS) and M.SMALL_YEN or M.GALLERY_YEN
+  local ext = (days and days > 7) and M.EXTENSION_YEN or 0
+  return base + ext
 end
 
-function M.priceYen(photoCount, days)
-  return M.priceUnits(photoCount, days) * M.UNIT_YEN
+--- §10.0/§10.7: a gallery covered by a free credit is 0 yen for the photos, whatever its size —
+--- the extension (if 14 days) is not free even then.
+local function priceYenMaybeFree(photoCount, days, isFree)
+  if isFree then
+    return (days and days > 7) and M.EXTENSION_YEN or 0
+  end
+  return M.priceYen(photoCount, days)
 end
 
 --- The server's number of galleries that are still free (`free_galleries_remaining`), or nil
@@ -45,9 +54,9 @@ function M.parseMaxPhotos(value)
   return math.floor(n)
 end
 
---- Same line, from an already-computed yen amount (1.2.0: a split send counts each gallery
---- separately — 枚数 300 で 1 単位 — and shows the total). `free` is the server's remaining
---- free galleries (nil = unknown: the free allowance is then not mentioned at all).
+--- Same line, from an already-computed yen amount. `free` is the server's remaining free
+--- galleries (nil = unknown: the free allowance is then not mentioned at all; the caller is
+--- expected to have already priced this as NOT free in that case).
 function M.priceLineYen(yen, free)
   local line = string.format('目安 %d 円（税込）', yen)
   if free == nil then return line end
@@ -56,16 +65,25 @@ function M.priceLineYen(yen, free)
 end
 
 --- The estimate line of the create dialog. `free` is the server's remaining free galleries
---- (nil = unknown: the free allowance is then not mentioned at all).
+--- (nil = unknown: the free allowance is then not mentioned at all, and the full price is
+--- shown — never assume free when it is not known). When free > 0, this one gallery is
+--- covered by a free credit: the photos are 0 yen (the extension, if any, is not).
 function M.priceLine(photoCount, days, free)
-  return M.priceLineYen(M.priceYen(photoCount, days), free)
+  local isFree = free ~= nil and free > 0
+  return M.priceLineYen(priceYenMaybeFree(photoCount, days, isFree), free)
 end
 
---- The total yen for several galleries (1.2.0's auto-split: each gallery is priced on its own
---- photo count, then added up). `segments` is an array of photo counts.
-function M.priceYenSplit(segments, days)
+--- The total yen for several galleries (the auto-split: each gallery is priced on its own
+--- photo count, then added up). `segments` is an array of photo counts, in send order. `free`
+--- (the server's remaining free galleries, nil = unknown) covers the FIRST `free` segments —
+--- example: splitting 2,000 photos into three galleries with 2 free credits left makes the
+--- 1st and 2nd 0 yen, the 3rd 88 yen.
+function M.priceYenSplit(segments, days, free)
   local total = 0
-  for _, count in ipairs(segments) do total = total + M.priceYen(count, days) end
+  for i, count in ipairs(segments) do
+    local isFree = free ~= nil and i <= free
+    total = total + priceYenMaybeFree(count, days, isFree)
+  end
   return total
 end
 
@@ -138,6 +156,38 @@ function M.jaMonthDay(m, d)
   return string.format('%d月%d日', m, d)
 end
 
+-- 2026-10-20 (pricing-plans-v0.1.md §10.6, B54): the expiry line needs the day of week and the
+-- time, not just the date — "10月27日（火）11:00" — since the server's own clock decides the
+-- hour (11:00 JST in practice), not this plug-in; whatever `expires_at` actually says is shown.
+local WEEKDAY_JA = { '日', '月', '火', '水', '木', '金', '土' } -- index 1 = Sunday (wd 0)
+
+--- 0 (Sunday) .. 6 (Saturday). daysFromCivil counts from 1970-01-01, a Thursday.
+local function weekday(y, m, d)
+  return (daysFromCivil(y, m, d) + 4) % 7
+end
+
+--- "10月27日（火）11:00" in the given local offset (JST = 32400). nil when `iso` cannot be
+--- parsed.
+function M.jaDateTimeWithWeekday(iso, offsetSec)
+  local epoch = M.isoToEpoch(iso)
+  if not epoch then return nil end
+  local localSec = epoch + (offsetSec or 0)
+  local y, m, d = civilFromDays(math.floor(localSec / 86400))
+  local secOfDay = localSec % 86400
+  local hh = math.floor(secOfDay / 3600)
+  local mi = math.floor((secOfDay % 3600) / 60)
+  return string.format('%d月%d日（%s）%02d:%02d', m, d, WEEKDAY_JA[weekday(y, m, d) + 1], hh, mi)
+end
+
+--- The shared "公開期限" / {期限} line text (CreateGallery.lua and RecentGalleries.lua both
+--- used to build this by hand from isoToLocalDate + jaMonthDay; 2026-10-20 needs the weekday
+--- and time too, so it is single-sourced here). '' when `iso` cannot be parsed (no line at all,
+--- same as before).
+function M.expireText(iso, offsetSec)
+  local s = M.jaDateTimeWithWeekday(iso, offsetSec)
+  return s and (s .. 'まで') or ''
+end
+
 function M.isoDate(y, m, d)
   return string.format('%04d-%02d-%02d', y, m, d)
 end
@@ -208,6 +258,18 @@ function M.urlEncodeSegment(s)
   return (tostring(s):gsub('[^%w%-%._~]', function(c)
     return string.format('%%%02X', c:byte())
   end))
+end
+
+--- 1.2.2: a gallery URL with the passcode folded into it, so opening the link alone is enough
+--- (the gallery side's own support is separate work; if the fragment's key name changes from
+--- "p" it will be told, hence the constant). Returns `url` unchanged when either argument is
+--- missing — there is then nothing to embed, and this must never produce a bare "#p=" or a
+--- url that lost its own value outright.
+M.PASSCODE_URL_KEY = 'p'
+function M.passcodeUrl(url, passcode)
+  if type(url) ~= 'string' or url == '' then return url end
+  if type(passcode) ~= 'string' or passcode == '' then return url end
+  return url .. '#' .. M.PASSCODE_URL_KEY .. '=' .. M.urlEncodeSegment(passcode)
 end
 
 --- Mask an API key for display: only the last 4 characters are shown.
@@ -587,18 +649,24 @@ end
 ---   title / URL / passcode / expiry date / "open in the browser … press 確定".
 --- The photographer can keep their own wording (a template with marks, see below); this is
 --- what is used until they do.
-M.DEFAULT_ANNOUNCEMENT_TEMPLATE = '写真をお送りします。\n{題}\n\nURL: {URL}\nパスコード: {パスコード}\n公開期限: {期限}\n\n'
+--- 1.2.2: the URL line carries {パスコード入りURL} (the URL with the passcode folded in, see
+--- M.passcodeUrl) rather than the bare {URL} — opening the link alone is then enough. The
+--- separate パスコード line stays too (unchanged here on purpose: the wording is for the
+--- proofread to settle, not something to redesign while just wiring this in).
+M.DEFAULT_ANNOUNCEMENT_TEMPLATE = '写真をお送りします。\n{題}\n\nURL: {パスコード入りURL}\nパスコード: {パスコード}\n公開期限: {期限}\n\n'
   .. 'ブラウザで開いて、気に入った写真に★を付けて「確定」を押してください。'
 M.ANNOUNCEMENT_TEMPLATE_MAX = 2000
 
--- the marks of a template ({題} {URL} {パスコード} {期限}; the English names work as well)
+-- the marks of a template ({題} {URL} {パスコード入りURL} {パスコード} {期限}; the English
+-- names work as well)
 local TEMPLATE_MARKS = {
   ['題'] = 'title', ['title'] = 'title',
   ['URL'] = 'url', ['url'] = 'url',
+  ['パスコード入りURL'] = 'passcodeUrl', ['passcodeurl'] = 'passcodeUrl',
   ['パスコード'] = 'passcode', ['passcode'] = 'passcode',
   ['期限'] = 'expire', ['expire'] = 'expire',
 }
-M.TEMPLATE_MARK_TEXT = '{題}　{URL}　{パスコード}　{期限}'
+M.TEMPLATE_MARK_TEXT = '{題}　{URL}　{パスコード入りURL}　{パスコード}　{期限}'
 
 --- A template that can be used: a non-empty string of reasonable length, line ends normalised.
 --- Anything else (nil, blank, huge) is the default. Never raises.
@@ -611,26 +679,33 @@ function M.normalizeTemplate(template)
   return template
 end
 
---- Fill a template. A line whose marks are all empty (no title, no expiry date) is left out, so the
---- default reads exactly as before. A template that lacks {URL} or {パスコード} gets the missing
---- value appended: the text is useless without them. Unknown or broken marks stay as they are.
---- @param opts table { title, url, passcode, expireText, template }
---- The {URL} mark's text: one URL as given, or (1.2.0's auto-split) several, one per line,
---- each marked "N/M：" — opts.urls wins over opts.url when both are given.
-local function urlMarkText(opts)
+--- One URL as given, or (1.2.0's auto-split) several, one per line, each marked "N/M：" —
+--- opts.urls wins over opts.url when both are given. `transform` (optional) runs on each URL
+--- before it is placed — 1.2.2's {パスコード入りURL} mark reuses this with M.passcodeUrl so the
+--- "N/M：" numbering is shared code between both marks (every URL gets the same treatment).
+--- @param opts table { url, urls }
+local function urlMarkText(opts, transform)
+  local function apply(url)
+    return transform and transform(url) or url
+  end
   if type(opts.urls) == 'table' and #opts.urls > 0 then
-    if #opts.urls == 1 then return opts.urls[1] end
+    if #opts.urls == 1 then return apply(opts.urls[1]) end
     local lines = {}
-    for i, url in ipairs(opts.urls) do lines[#lines + 1] = string.format('%d/%d：%s', i, #opts.urls, url) end
+    for i, url in ipairs(opts.urls) do lines[#lines + 1] = string.format('%d/%d：%s', i, #opts.urls, apply(url)) end
     return table.concat(lines, '\n')
   end
-  return opts.url or ''
+  return opts.url and apply(opts.url) or ''
 end
 
+--- Fill a template. A line whose marks are all empty (no title, no expiry date) is left out, so the
+--- default reads exactly as before. A template that lacks a URL mark or {パスコード} gets the
+--- missing value appended: the text is useless without them. Unknown or broken marks stay as they are.
+--- @param opts table { title, url, passcode, expireText, template }
 function M.announcement(opts)
   local template = M.normalizeTemplate(opts.template)
   local values = {
     title = opts.title or '', url = urlMarkText(opts), passcode = opts.passcode or '', expire = opts.expireText or '',
+    passcodeUrl = urlMarkText(opts, function(url) return M.passcodeUrl(url, opts.passcode) end),
   }
   local used = {}
   local lines = {}
@@ -646,7 +721,7 @@ function M.announcement(opts)
     end)
     if not (marks > 0 and filled == 0) then lines[#lines + 1] = out end
   end
-  if not used.url and values.url ~= '' then
+  if not used.url and not used.passcodeUrl and values.url ~= '' then
     lines[#lines + 1] = ''
     lines[#lines + 1] = 'URL: ' .. values.url
   end
@@ -689,11 +764,13 @@ function M.templateFromAnnouncement(announcement, opts)
   -- 1.2.0's auto-split: M.announcement wrote several URLs as one "N/M：url" line each (the
   -- first keeping whatever else stood on its line, e.g. "URL: "; the rest are nothing but that
   -- token). A single URL is unaffected (same as replaceAll). Must fold every one of them back
-  -- to one {URL} mark — leaving even one of them as a literal URL would carry one client's
-  -- gallery link into the template used for the next client's announcement (audit 15 §3.4).
-  local function replaceUrls(source, urls)
+  -- to one mark — leaving even one of them as a literal URL would carry one client's gallery
+  -- link into the template used for the next client's announcement (audit 15 §3.4).
+  -- `mark` is '{URL}' or (1.2.2) '{パスコード入りURL}' — the shape is identical either way, only
+  -- which values are being searched for and which mark replaces them differs.
+  local function replaceUrls(source, urls, mark)
     if type(urls) ~= 'table' or #urls == 0 then return source end
-    if #urls == 1 then return replaceAll(source, urls[1], '{URL}') end
+    if #urls == 1 then return replaceAll(source, urls[1], mark) end
     local n = #urls
     local lines = {}
     for line in (source .. '\n'):gmatch('(.-)\n') do lines[#lines + 1] = line end
@@ -703,7 +780,7 @@ function M.templateFromAnnouncement(announcement, opts)
       local marker = string.format('1/%d：%s', n, urls[1])
       local at = line:find(marker, 1, true)
       if at then
-        out[#out + 1] = line:sub(1, at - 1) .. '{URL}' .. line:sub(at + #marker)
+        out[#out + 1] = line:sub(1, at - 1) .. mark .. line:sub(at + #marker)
         local skip = i
         for k = 2, n do
           if lines[skip + 1] == string.format('%d/%d：%s', k, n, urls[k]) then
@@ -772,9 +849,23 @@ function M.templateFromAnnouncement(announcement, opts)
     end
     result = table.concat(lines, '\n')
   end
+  -- 1.2.2: try the passcode-embedded form first (M.announcement's own default writes that
+  -- one now) — only when a passcode was actually given, so this never claims "{パスコード入り
+  -- URL}" for a plain URL that never had one embedded (M.passcodeUrl would just hand the bare
+  -- URL back in that case, indistinguishable from the plain form below). Whatever is left
+  -- after that falls to the bare {URL} mark, unchanged — older saved templates still round-trip.
+  local hasPasscode = type(opts.passcode) == 'string' and opts.passcode ~= ''
   if type(opts.urls) == 'table' and #opts.urls > 0 then
-    result = replaceUrls(result, opts.urls)
+    if hasPasscode then
+      local withPasscode = {}
+      for i, url in ipairs(opts.urls) do withPasscode[i] = M.passcodeUrl(url, opts.passcode) end
+      result = replaceUrls(result, withPasscode, '{パスコード入りURL}')
+    end
+    result = replaceUrls(result, opts.urls, '{URL}')
   else
+    if hasPasscode then
+      result = replaceAll(result, M.passcodeUrl(opts.url, opts.passcode), '{パスコード入りURL}')
+    end
     result = replaceAll(result, opts.url, '{URL}')
   end
   result = replaceOnce(result, opts.passcode, '{パスコード}', 'パスコード')

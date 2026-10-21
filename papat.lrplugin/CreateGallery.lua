@@ -87,7 +87,7 @@ local function askSettings(context, catalog, count, free, segments)
   props.canSubmit = true
 
   local function priceFor(days)
-    if segments and #segments > 1 then return text.priceLineYen(text.priceYenSplit(segments, days), free) end
+    if segments and #segments > 1 then return text.priceLineYen(text.priceYenSplit(segments, days, free), free) end
     return text.priceLine(count, days, free)
   end
   props.priceText = priceFor(7)
@@ -153,8 +153,8 @@ local function askSettings(context, catalog, count, free, segments)
 
     f:row {
       f:static_text { title = '保存期間', width = 80 },
-      f:radio_button { title = '7日', value = bind('days'), checked_value = 7 },
-      f:radio_button { title = '14日', value = bind('days'), checked_value = 14 },
+      f:radio_button { title = '7泊8日（8日目の11:00まで）', value = bind('days'), checked_value = 7 },
+      f:radio_button { title = '14泊15日（15日目の11:00まで）', value = bind('days'), checked_value = 14 },
     },
     -- its own line: the estimate (with the server's free-gallery count) is wider than the rest
     f:static_text { title = bind('priceText'), text_color = GREY, width = 520 },
@@ -272,9 +272,14 @@ end
 -- Creating one gallery (title already carries its "（1/2）" suffix, if any)
 -- ---------------------------------------------------------------------------
 
+--- @param expectedPhotos number  how many photos this one gallery (this segment, if split)
+---   will be sent — 0..1,000 (pricing-plans-v0.1.md §10.4): lets the server check the monthly
+---   limit and whether a card is needed before anything is sent, instead of only discovering
+---   a problem partway through (at photo 89, say). Optional on the server's side — an older
+---   plug-in or the CLI simply does not send it.
 --- @return table|nil created  { sid, url, expiresAt, expireText } — nil if it could not be
 ---   created (an error dialog has already been shown; the caller should just stop)
-local function createOneGallery(apiKey, settings, title)
+local function createOneGallery(apiKey, settings, title, expectedPhotos)
   local created = api.createGallery(apiKey, {
     title = title,
     days = settings.days,
@@ -282,6 +287,7 @@ local function createOneGallery(apiKey, settings, title)
     passcode = settings.passcode,
     keyColor = settings.keyColor ~= '' and settings.keyColor or nil,
     idempotencyKey = ids.uuid(),
+    expectedPhotos = expectedPhotos,
   })
   if not created.ok then
     ui.showApiError('ギャラリーを作成できませんでした', created)
@@ -298,10 +304,9 @@ local function createOneGallery(apiKey, settings, title)
   update.rememberFree(created.data.free_galleries_remaining)
 
   local expiresAt = tostring(created.data.expires_at or '')
-  local y, m, d = text.isoToLocalDate(expiresAt, ui.localOffset())
   return {
     sid = sid, url = url, expiresAt = expiresAt,
-    expireText = y and (text.jaMonthDay(m, d) .. 'まで') or '',
+    expireText = text.expireText(expiresAt, ui.localOffset()),
   }
 end
 
@@ -477,7 +482,7 @@ local function run(context)
   local galleries, sendList, offset = {}, {}, 0
   for i, count in ipairs(segments) do
     local title = (#segments > 1) and string.format('%s（%d/%d）', settings.title, i, #segments) or settings.title
-    local created = createOneGallery(apiKey, settings, title)
+    local created = createOneGallery(apiKey, settings, title, count)
     if not created then
       -- an error dialog for THIS failure has already been shown; any earlier gallery in this
       -- same round must not be left behind empty (audit 15 §3.1)

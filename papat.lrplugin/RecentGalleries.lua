@@ -156,8 +156,7 @@ local function run(context)
 
   local function refresh()
     local entry = entries[props.index] or entries[1]
-    local y, m, d = text.isoToLocalDate(entry.expiresAt, offset)
-    local expireText = y and (text.jaMonthDay(m, d) .. 'まで') or ''
+    local expireText = text.expireText(entry.expiresAt, offset)
     props.url = entry.url or ''
     props.passcode = entry.passcode or ''
     props.expireText = expireText

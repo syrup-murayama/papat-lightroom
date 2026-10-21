@@ -778,6 +778,11 @@ run('CreateGallery.lua')
 check(colorCreate and colorCreate.key_color == nil, 'color: the create request carries no colour')
 check(colorManifest and colorManifest.key_color == nil, 'color: the manifest carries no colour')
 check(env.prefs.recentKeyColors == '#111111', 'color: the stored recent colours are left alone')
+-- expected_photos (pricing-plans-v0.1.md §10.4): the create request says how many photos this
+-- one gallery will get, so the server can check the monthly limit and the card requirement
+-- before anything is sent
+check(colorCreate and colorCreate.expected_photos == 1, 'expected_photos: the create request carries the photo count ('
+  .. tostring(colorCreate and colorCreate.expected_photos) .. ')')
 do
   -- nothing about a colour on the screen
   local strings = {}
@@ -1381,6 +1386,10 @@ do
   check(resultProps.guidance:find('写真をお送りします。', 1, true) == 1
     and resultProps.guidance:find('公開期限: ', 1, true) ~= nil
     and resultProps.guidance:find('ブラウザで開いて', 1, true) ~= nil, 'template: the default text in the result window')
+  -- 1.2.2: the default template's URL line carries the passcode (end to end, through the real
+  -- CreateGallery.lua flow, not just lib/text.lua directly)
+  check(resultProps.guidance:find('URL: ' .. resultProps.url .. '#p=' .. resultProps.passcode, 1, true) ~= nil,
+    'template: the default URL line carries "#p=<passcode>" (' .. resultProps.guidance:match('URL:.-\n') .. ')')
 
   -- an own template in the preferences
   result = createWith({ locationPromptShown = true,
@@ -2595,7 +2604,7 @@ do
   price = createWith(freeServer(0, 0))
   check(price and price:find('無料の残りはありません', 1, true) ~= nil, 'free: zero says none are left')
   price = createWith(freeServer(nil, nil))
-  check(price and price:find('無料') == nil and price:find('目安 88 円') ~= nil, 'free: unknown count = free allowance not mentioned')
+  check(price and price:find('無料') == nil and price:find('目安 8 円') ~= nil, 'free: unknown count = free allowance not mentioned')
   price = createWith(freeServer(5, 5, true))
   check(price and price:find('無料') == nil, 'free: status unreachable = not mentioned')
   modules.LrDialogs.presentModalDialog = presentBefore
@@ -2626,40 +2635,48 @@ do
     return creates, lastDialog('message')
   end
 
-  -- below the auto-split trigger (888): the old hard limit still applies as a plain refusal
+  -- below the auto-split trigger (1,000, 2026-10-20): the old hard limit still applies as a
+  -- plain refusal
   local creates, msg = limitRun(50, 60)
   check(creates == 0 and msg and msg.title == '写真が多すぎます' and msg.info:find('50 枚まで', 1, true)
     and msg.info:find('現在 60 枚', 1, true), 'limit: the server\'s max_photos (50) is the limit and is in the sentence')
   creates = limitRun(50, 40)
   check(creates == 1, 'limit: 40 photos are fine under a limit of 50')
 
-  -- above 888: 1.2.0's auto-split (lib/split.lua) tries first; these photos are all undated
-  -- (manyPhotos never sets a capture time), so it falls back to a fixed cut at 888 — a
-  -- remainder under 100 merges back into one gallery, 100 or more stays split
-  creates, msg = limitRun(nil, 901)
-  check(creates == 1 and msg == nil,
-    'limit: 901 undated photos (888+13) merges back to one gallery (1000 until the server says)')
-  creates, msg = limitRun('junk', 901)
+  -- at/under 1,000 (the default max_photos AND the auto-split trigger — the usual case in
+  -- production, since the server's real max_photos is 1,000): never split, whatever the shape
+  creates, msg = limitRun(nil, 1000)
+  check(creates == 1 and msg == nil, 'limit: exactly 1,000 undated photos never split (1,000 until the server says)')
+  creates, msg = limitRun('junk', 1000)
   check(creates == 1 and msg == nil, 'limit: a max_photos that makes no sense is ignored the same way')
-  creates = limitRun(1200, 1000)
-  check(creates == 2, 'limit: 1000 undated photos (888+112) split into two galleries even though 1200 would fit one')
 
-  -- a custom max_photos too small even for the auto-split's own target (888) still refuses
-  -- cleanly instead of sending an oversized gallery (lib/split.lua's own clamp keeps every
-  -- segment at or under max_photos; this is CreateGallery.lua's defensive check on top of it)
+  -- above 1,000: the auto-split (lib/split.lua) tries first; these photos are all undated
+  -- (manyPhotos never sets a capture time), so it falls back to a fixed cut at 800 — a server
+  -- that reports a larger max_photos (1,200) still splits, because the trigger (1,000) is
+  -- fixed, not max_photos-relative (pricing-plans-v0.1.md §10.5/§10.11: splitting is about not
+  -- fitting in one 88-yen gallery, not about the server's own per-gallery ceiling)
+  creates = limitRun(1200, 1100)
+  check(creates == 2, 'limit: 1,100 undated photos (800+300) still split even though 1,200 would fit one gallery')
+
+  -- a custom max_photos too small even for a selection at/under the trigger (1,000) refuses
+  -- cleanly instead of silently trying to make it fit — 1.2.2's trigger is a fixed number
+  -- (production's own max_photos is always 1,000 too), not derived from max_photos, so a
+  -- selection the auto-split never even attempts to cut can still exceed a custom max_photos
   creates, msg = limitRun(500, 1000)
-  check(creates == 2, 'limit: a small max_photos (500) still splits, just into smaller pieces')
+  check(creates == 0 and msg and msg.title == '写真が多すぎます',
+    'limit: 1,000 photos is under the trigger (so never split), and still refused against a smaller max_photos (500)')
 
   env.updateCheckLive = false
   env.prefs = { locationPromptShown = true }
 end
 
 -- ---------------------------------------------------------------------------
--- Auto-split (1.2.0): the settings dialog's one-line notice, two galleries with suffixed
--- titles, one combined multi-URL invitation, two "最近のギャラリー" entries, and the manifest
--- group numbers restarting at 1 for the second gallery. 900 photos with a deliberate one-hour
--- gap at position 800 (well inside lib/split.lua's [750,888] range), so the cut is a real time
--- group boundary rather than the "no information at all" fallback already covered above.
+-- Auto-split (1.2.0, numbers updated 2026-10-20): the settings dialog's one-line notice, two
+-- galleries with suffixed titles, one combined multi-URL invitation, two "最近のギャラリー"
+-- entries, and the manifest group numbers restarting at 1 for the second gallery. 1,100 photos
+-- (above the 1,000 trigger) with a deliberate one-hour gap at position 780 (well inside
+-- lib/split.lua's [760,800] range), so the cut is a real time group boundary rather than the
+-- "no information at all" fallback already covered above.
 -- ---------------------------------------------------------------------------
 do
   local function photoAt(path, wallTime)
@@ -2668,8 +2685,8 @@ do
     return p
   end
   local splitPhotos, t = {}, 1790000000
-  for i = 1, 900 do
-    if i == 801 then t = t + 3600 end -- the one boundary: 1 hour, against ~10s elsewhere
+  for i = 1, 1100 do
+    if i == 781 then t = t + 3600 end -- the one boundary: 1 hour, against ~10s elsewhere
     splitPhotos[i] = photoAt(string.format('/p/s%04d.NEF', i), os.date('!%Y-%m-%dT%H:%M:%S', t))
     t = t + 10
   end
@@ -2677,12 +2694,13 @@ do
   env.passwords.recentGalleries = nil
   env.prefs = { locationPromptShown = true }
 
-  local sidCount, createdTitles = 0, {}
+  local sidCount, createdTitles, createdExpectedPhotos = 0, {}, {}
   env.server = function(req)
     if req.method == 'POST' and req.url:find('/galleries$') then
       sidCount = sidCount + 1
       local body = json.decode(req.body)
       createdTitles[#createdTitles + 1] = body.title
+      createdExpectedPhotos[#createdExpectedPhotos + 1] = body.expected_photos
       return 201, { ok = true, sid = 'SIDSPLIT' .. sidCount, tenant_id = 'abc123',
         path = '/t/abc123/s/SIDSPLIT' .. sidCount, expires_at = iso(7) }
     end
@@ -2704,12 +2722,17 @@ do
   run('CreateGallery.lua')
   modules.LrDialogs.presentModalDialog = realPresentSplit
 
-  check(sidCount == 2, 'split: two galleries created at the time-group boundary (800/100)')
-  check(splitNoticeSeen == '900 枚を 2 つのギャラリーに分けて送ります（800枚・100枚）',
+  check(sidCount == 2, 'split: two galleries created at the time-group boundary (780/320)')
+  check(splitNoticeSeen == '1100 枚を 2 つのギャラリーに分けて送ります（780枚・320枚）',
     'split: the one-line notice before creating (' .. tostring(splitNoticeSeen) .. ')')
   check(createdTitles[1] and createdTitles[1]:find('（1/2）', 1, true) ~= nil
     and createdTitles[2] and createdTitles[2]:find('（2/2）', 1, true) ~= nil,
     'split: titles carry the (1/2) / (2/2) suffix')
+  -- expected_photos (pricing-plans-v0.1.md §10.4): each gallery carries its OWN segment's
+  -- photo count, not the original 1,100-photo total and not the same value twice
+  check(createdExpectedPhotos[1] == 780 and createdExpectedPhotos[2] == 320,
+    'expected_photos: each split gallery carries its own segment count (' ..
+    tostring(createdExpectedPhotos[1]) .. '/' .. tostring(createdExpectedPhotos[2]) .. ')')
 
   check(resultProps ~= nil, 'split: the result dialog was shown')
   if resultProps then
@@ -2718,6 +2741,10 @@ do
     check(resultProps.guidance:find('/s/SIDSPLIT1/', 1, true) ~= nil
       and resultProps.guidance:find('/s/SIDSPLIT2/', 1, true) ~= nil,
       'split: the invitation carries both galleries\' own URLs')
+    -- 1.2.2: each numbered URL carries the (shared) passcode, not just the first one
+    check(resultProps.guidance:find('/s/SIDSPLIT1/#p=' .. resultProps.passcode, 1, true) ~= nil
+      and resultProps.guidance:find('/s/SIDSPLIT2/#p=' .. resultProps.passcode, 1, true) ~= nil,
+      'split: both numbered URLs carry "#p=<passcode>", not just the first')
   end
 
   local recent = env.passwords.recentGalleries and json.decode(env.passwords.recentGalleries) or {}
@@ -2738,21 +2765,21 @@ do
   local g1 = bySid.SIDSPLIT1 or {}
   local g2 = bySid.SIDSPLIT2 or {}
   check(g1.s0001 == 1, 'split: first gallery, first photo is group 1 (' .. tostring(g1.s0001) .. ')')
-  check(g2.s0801 == 1, 'split: second gallery, its own first photo restarts at group 1 (' .. tostring(g2.s0801) .. ')')
-  check((g1.s0001 or 0) > 0 and (g2.s0801 or 0) > 0, 'split: neither gallery sent group 0 (every photo is dated)')
+  check(g2.s0781 == 1, 'split: second gallery, its own first photo restarts at group 1 (' .. tostring(g2.s0781) .. ')')
+  check((g1.s0001 or 0) > 0 and (g2.s0781 or 0) > 0, 'split: neither gallery sent group 0 (every photo is dated)')
 end
 
 -- ---------------------------------------------------------------------------
 -- Auto-split, partial failure (audit 15 §3.1): the 2nd gallery's own creation fails after the
 -- 1st already succeeded. The 1st must not be left behind — empty, in a resume job, in "最近の
--- ギャラリー", or (課金 ON) holding its reserved base unit. 1000 undated photos -> {888, 112}
--- (the same fixed-888 fallback already covered above; the point here is the failure, not the
+-- ギャラリー", or (課金 ON) holding its reserved base unit. 1,100 undated photos -> {800, 300}
+-- (the same fixed-800 fallback already covered above; the point here is the failure, not the
 -- cut point).
 -- ---------------------------------------------------------------------------
 do
   env.passwords.recentGalleries = nil
   env.prefs = { locationPromptShown = true }
-  activeCatalog = newCatalog(manyPhotos(1000))
+  activeCatalog = newCatalog(manyPhotos(1100))
 
   local posts, deletes = 0, {}
   env.server = function(req)
@@ -2793,7 +2820,7 @@ end
 do
   env.passwords.recentGalleries = nil
   env.prefs = { locationPromptShown = true }
-  activeCatalog = newCatalog(manyPhotos(1000))
+  activeCatalog = newCatalog(manyPhotos(1100))
 
   local posts = 0
   env.server = function(req)
