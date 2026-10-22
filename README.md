@@ -1,10 +1,10 @@
-<p><img src="docs/assets/papat-wordmark.svg" alt="papat" height="56"></p>
+<p><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/papat-wordmark-dark.svg"><img src="docs/assets/papat-wordmark.svg" alt="papat" height="56"></picture></p>
 
 # papat for Lightroom Classic
 
 Lightroom Classic から [papat](https://papat.app/) のギャラリーを作り、クライアントが選んだ写真を Lightroom に取り込むプラグインです。
 
-現在のプラグイン版: **1.2.2**（macOS のみ。Windows は準備中）。インストーラと ZIP は [Releases](https://github.com/syrup-murayama/papat-lightroom/releases) と <https://papat.app/lightroom/> で配っています（同じファイルです）。
+現在のプラグイン版: **1.2.3**（macOS のみ。Windows は準備中）。インストーラと ZIP は [Releases](https://github.com/syrup-murayama/papat-lightroom/releases) と <https://papat.app/lightroom/> で配っています（同じファイルです）。
 
 - 選んだ写真から、パスコード付きの共有ギャラリーを作る（URL・パスコード・案内文までコピー1回）
 - クライアントが「確定」した採用写真を、コレクションに入れて採用フラグ・メモ・タグを反映する
