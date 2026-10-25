@@ -118,7 +118,7 @@ end
 local function keyOf(photo)
   local uuid = uuidOf(photo)
   if uuid then return 'u:' .. uuid end
-  return 'p:' .. tostring(photo:getRawMetadata('path') or '') .. '|' .. tostring(photo:getRawMetadata('copyName') or '')
+  return 'p:' .. tostring(photo:getRawMetadata('path') or '') .. '|' .. tostring(photo:getFormattedMetadata('copyName') or '')
 end
 
 local iccSegment
@@ -475,9 +475,9 @@ function M.run(o)
       -- comment on opts.minEdge / the 2026-10-19 field report this responds to).
       local function minimumEdgeFor(item)
         local minimum = MIN_PREVIEW_EDGE
-        local okSize, w, h = LrTasks.pcall(function()
-          return item.photo:getRawMetadata('croppedWidth'), item.photo:getRawMetadata('croppedHeight')
-        end)
+        -- raw 'croppedDimensions' = { width =, height = } (there are no croppedWidth/Height keys)
+        local okSize, dims = LrTasks.pcall(function() return item.photo:getRawMetadata('croppedDimensions') end)
+        local w, h = type(dims) == 'table' and dims.width, type(dims) == 'table' and dims.height
         if okSize and tonumber(w) and tonumber(h) and math.max(w, h) > 0 then
           minimum = math.min(MIN_PREVIEW_EDGE, math.floor(math.max(w, h) * 0.95))
         end

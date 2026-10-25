@@ -381,6 +381,57 @@ modules.LrFileUtils = {
   isEmptyDirectory = function(p) return sh('ls -A "' .. p .. '" 2>/dev/null') == '' end,
 }
 
+-- Lightroom Classic SDK (LrPhoto) key tables -------------------------------
+local function keySet(list)
+  local set = {}
+  for k in list:gmatch('%S+') do set[k] = true end
+  return set
+end
+-- photo:getRawMetadata(key)
+local SDK_RAW_KEYS = keySet [[
+  altTextAccessibility aperture aspectRatio bitDepth colorNameForLabel copyrightState
+  countStackInFolderMembers countVirtualCopies croppedDimensions customMetadata dateTime
+  dateTimeDigitized dateTimeDigitizedISO8601 dateTimeISO8601 dateTimeOriginal
+  dateTimeOriginalISO8601 dimensions durationInSeconds durationRatio editCount exposureBias
+  extDescrAccessibility fileFormat fileSize flash focalLength focalLength35mm gps gpsAltitude
+  gpsImgDirection height isCropped isExported isInStackInFolder isVideo isVirtualCopy
+  isoSpeedRating keywords lastEditTime locationIsPrivate masterPhoto path pickStatus rating
+  shutterSpeed smartPreviewInfo stackInFolderIsCollapsed stackInFolderMembers
+  stackPositionInFolder topOfStackInFolderContainingPhoto trimmedDurationInSeconds
+  trimmedDurationRatio uuid virtualCopies width
+]]
+-- photo:getFormattedMetadata(key)
+local SDK_FORMATTED_KEYS = keySet [[
+  additionalModelInfo altTextAccessibility aperture artist artworksShown brightnessValue
+  cameraMake cameraModel cameraSerialNumber caption city codeOfOrgShown copyName copyright
+  copyrightInfoUrl copyrightOwner copyrightState country creator creatorAddress creatorCity
+  creatorCountry creatorEmail creatorJobTitle creatorPhone creatorPostalCode
+  creatorStateProvince creatorUrl croppedDimensions dateCreated dateTime dateTimeDigitized
+  dateTimeOriginal descriptionWriter digImageGUID dimensions duration event exposure
+  exposureBias exposureProgram extDescrAccessibility fileName fileSize fileType flash
+  focalLength focalLength35mm folderName frameRate gps gpsAltitude gpsImgDirection headline
+  imageCreator imageSupplier imageSupplierImageId instructions intellectualGenre iptcCategory
+  iptcOtherCategories iptcSubjectCode isoCountryCode isoSpeedRating jobIdentifier keywordTags
+  keywordTagsForExport label lens licensor location locationCreated locationShown maxAvailHeight
+  maxAvailWidth meteringMode minorModelAge modelAge modelReleaseID modelReleaseStatus
+  nameOfOrgShown personShown plusVersion preservedFileName propertyReleaseID
+  propertyReleaseStatus provider rating registryId rightsUsageTerms scene shutterSpeed
+  software source sourceType stateProvince subjectDistance title trimmedDuration
+]]
+-- photo:setRawMetadata(key, value)
+local SDK_SETTABLE_KEYS = keySet [[
+  rating label title caption copyName creator creatorJobTitle creatorAddress creatorCity
+  creatorStateProvince creatorPostalCode creatorCountry creatorPhone creatorEmail creatorUrl
+  headline iptcSubjectCode descriptionWriter iptcCategory iptcOtherCategories dateCreated
+  intellectualGenre scene location city stateProvince country isoCountryCode jobIdentifier
+  instructions provider source copyright copyrightState rightsUsageTerms copyrightInfoUrl
+  colorNameForLabel personShown locationCreated locationShown nameOfOrgShown codeOfOrgShown
+  event artworksShown additionalModelInfo modelAge minorModelAge modelReleaseStatus
+  modelReleaseID imageSupplier imageSupplierImageId registryId maxAvailWidth maxAvailHeight
+  sourceType imageCreator copyrightOwner licensor propertyReleaseID propertyReleaseStatus gps
+  gpsAltitude pickStatus gpsImgDirection altTextAccessibility extDescrAccessibility
+]]
+
 -- Photos / catalog ---------------------------------------------------------
 local function newPhoto(path, props)
   local photo = { path = path, props = props or {}, raw = { uuid = 'uuid-' .. path }, keywords = {}, writes = {} }
@@ -422,8 +473,26 @@ local function newPhoto(path, props)
     end
     return {}
   end
-  function photo:getRawMetadata(k) if k == 'path' then return self.path end return self.raw[k] end
-  function photo:setRawMetadata(k, v) self.raw[k] = v; self.writes[#self.writes + 1] = k end
+  -- Like the real LrPhoto: a key that is not in the SDK's table for that call raises
+  -- 'Unknown key' (the 1.2.2 getRawMetadata('caption') bug slipped through a fake that answered
+  -- every key). The lists are copied from the Lightroom Classic SDK reference, LrPhoto.
+  function photo:getRawMetadata(k)
+    if not SDK_RAW_KEYS[k] then error('Unknown key: "' .. tostring(k) .. '"', 2) end
+    if k == 'path' then return self.path end
+    return self.raw[k]
+  end
+  function photo:getFormattedMetadata(k)
+    if not SDK_FORMATTED_KEYS[k] then error('Unknown key: "' .. tostring(k) .. '"', 2) end
+    if k == 'caption' and self.failCaptionRead then error('simulated: caption cannot be read', 2) end
+    local v = (self.fmt or {})[k]
+    if v == nil and SDK_SETTABLE_KEYS[k] then v = self.raw[k] end -- what setRawMetadata wrote shows up
+    return v
+  end
+  function photo:setRawMetadata(k, v)
+    if not SDK_SETTABLE_KEYS[k] then error('Unknown key: "' .. tostring(k) .. '"', 2) end
+    if k == 'caption' and self.failCaptionWrite then error('simulated: caption cannot be written', 2) end
+    self.raw[k] = v; self.writes[#self.writes + 1] = k
+  end
   function photo:setPropertyForPlugin(_, k, v) self.props[k] = v end
   function photo:addKeyword(kw) self.keywords[#self.keywords + 1] = kw end
   return photo
@@ -483,6 +552,7 @@ local function newCatalog(photos)
     return c
   end
   function catalog:createKeyword(name, _, include, parent)
+    if self.badKeyword and name == self.badKeyword then error('simulated: keyword refused', 2) end
     local kw = { name = name, include = include, parent = parent }
     self.keywords[#self.keywords + 1] = kw
     return kw
@@ -1746,7 +1816,7 @@ check((timingOf('SIDP') or ''):find('プレビューから 5 枚・書き出し�
 -- small originals / tight crops: a preview as small as the export would be is fine; the sRGB tag is added
 photos = manyPhotos(3)
 for _, p in ipairs(photos) do
-  p.raw.croppedWidth, p.raw.croppedHeight = 1500, 1000
+  p.raw.croppedDimensions = { width = 1500, height = 1000 } -- raw key (there is no croppedWidth / croppedHeight)
   p.thumbDims = { 1500, 1000 }
 end
 activeCatalog = newCatalog(photos)
@@ -2439,6 +2509,99 @@ check(linkedA.raw.caption == 'keep me\n— papat: 余白', 'rerun: caption not d
 local c2 = 0
 for _ in pairs(activeCatalog.collections) do c2 = c2 + 1 end
 check(c2 == 1, 'rerun: no duplicate collection')
+
+-- the photo fake now refuses keys outside the SDK's tables, like the real LrPhoto
+do
+  local probe = newPhoto('/p/PROBE.NEF')
+  local okRaw, errRaw = pcall(probe.getRawMetadata, probe, 'caption')
+  check(not okRaw and tostring(errRaw):find('Unknown key: "caption"', 1, true) ~= nil, 'fake photo: getRawMetadata("caption") raises Unknown key (as in Lightroom)')
+  check(pcall(probe.getFormattedMetadata, probe, 'caption') == true, 'fake photo: getFormattedMetadata("caption") is fine')
+  check(select(1, pcall(probe.getRawMetadata, probe, 'copyName')) == false, 'fake photo: copyName is not a raw key')
+  check(select(1, pcall(probe.getRawMetadata, probe, 'croppedWidth')) == false, 'fake photo: croppedWidth is not a raw key')
+  check(select(1, pcall(probe.getFormattedMetadata, probe, 'nonsense')) == false, 'fake photo: unknown formatted key raises')
+end
+
+-- 1.2.3: adopted photos with memos (the 2026-10-23 field case: 7 adopted, 5 with a memo, some
+-- with an existing caption). Before 1.2.3 this stopped with 'Unknown key: "caption"' halfway
+-- through the write, so the later photos got no pick flag, memo or tag.
+do
+  local savedServer = env.server -- section 7 below reuses the server of section 6
+  local memoPhotos = {}
+  local adopted = {}
+  for i = 1, 7 do
+    local name = string.format('IMG_%04d', i)
+    local ph = newPhoto('/m/' .. name .. '.NEF', { papatSourceId = 'm-' .. i, papatSid = 'SIDM', papatFilename = name .. '.jpg' })
+    memoPhotos[i] = ph
+    adopted[i] = { source_id = 'm-' .. i, filename = name .. '.jpg', stem = name, adopted = true, rating = 0,
+      tags = (i % 2 == 0) and { 'タグ' } or {}, memo = (i <= 5) and ('メモ' .. i) or '' }
+  end
+  memoPhotos[1].raw.caption = 'keep me' -- an existing caption stays, the memo goes after it
+  activeCatalog = newCatalog(memoPhotos)
+  env.prefs = { locationPromptShown = true }
+  env.server = function(req)
+    if req.url:find('/api/v1/galleries$') then
+      return 200, { ok = true, galleries = {
+        { sid = 'SIDM', title = 'ショートリスト', status = 'active', created_at = iso(-1), expires_at = iso(6), photos = 10 },
+      } }
+    end
+    if req.url:find('/selections$') then
+      return 200, { ok = true, schema = 'papat.selections/v1', sid = 'SIDM', title = 'ショートリスト', adopted = adopted }
+    end
+    return 404, { ok = false, error = 'not found' }
+  end
+  run('ImportSelections.lua')
+  local picked, captioned = 0, 0
+  for i, ph in ipairs(memoPhotos) do
+    if ph.raw.pickStatus == 1 then picked = picked + 1 end
+    if ph.raw.caption and ph.raw.caption:find('— papat: メモ' .. i, 1, true) then captioned = captioned + 1 end
+  end
+  check(picked == 7, 'memo import: all 7 adopted photos get the pick flag (' .. picked .. ')')
+  check(captioned == 5, 'memo import: the 5 memos are appended (' .. captioned .. ')')
+  check(memoPhotos[1].raw.caption == 'keep me\n— papat: メモ1', 'memo import: existing caption kept, memo after it')
+  check(memoPhotos[7].raw.caption == nil, 'memo import: a photo without a memo keeps no caption')
+  local done = lastDialog('message')
+  check(done and done.title == 'セレクトを読み込みました' and done.info:find('メモを説明に追記: 5 枚', 1, true) ~= nil
+    and done.info:find('追記できませんでした', 1, true) == nil, 'memo import: result says 5 captioned, none skipped')
+  check(#activeCatalog.keywords == 2, 'memo import: tags still created (papat + タグ: ' .. #activeCatalog.keywords .. ')')
+
+  -- one photo whose caption cannot be written, one whose caption cannot be read: those two are
+  -- skipped and counted; every other photo (pick flag, memo, tag) goes through
+  for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.writes = {} end
+  memoPhotos[1].raw.caption = 'keep me'
+  for i = 2, 5 do memoPhotos[i].raw.caption = nil end
+  memoPhotos[2].failCaptionWrite = true
+  memoPhotos[4].failCaptionRead = true
+  run('ImportSelections.lua')
+  local picked2 = 0
+  for _, ph in ipairs(memoPhotos) do if ph.raw.pickStatus == 1 then picked2 = picked2 + 1 end end
+  check(picked2 == 7, 'memo failure: every photo still gets the pick flag (' .. picked2 .. ')')
+  check(memoPhotos[1].raw.caption == 'keep me\n— papat: メモ1' and memoPhotos[3].raw.caption == '— papat: メモ3'
+    and memoPhotos[5].raw.caption == '— papat: メモ5', 'memo failure: the other photos still get their memo')
+  check(memoPhotos[2].raw.caption == nil and memoPhotos[4].raw.caption == nil, 'memo failure: the two failing photos are left as they were')
+  local done2 = lastDialog('message')
+  check(done2 and done2.info:find('メモを説明に追記: 3 枚', 1, true) ~= nil
+    and done2.info:find('（2 枚は説明にメモを追記できませんでした）', 1, true) ~= nil, 'memo failure: result shows 3 captioned and 2 skipped')
+  check(#activeCatalog.keywords == 4, 'memo failure: tags still created on the re-run (2 more keyword calls)')
+
+  -- a keyword Lightroom refuses: only the photos that carry that tag are skipped and counted
+  for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.keywords = {} end
+  for i = 1, 7 do memoPhotos[i].failCaptionWrite, memoPhotos[i].failCaptionRead = nil, nil end
+  for i = 2, 5 do memoPhotos[i].raw.caption = nil end
+  memoPhotos[1].raw.caption = 'keep me'
+  activeCatalog.badKeyword = 'タグ'
+  run('ImportSelections.lua')
+  local picked3, tagged = 0, 0
+  for _, ph in ipairs(memoPhotos) do
+    if ph.raw.pickStatus == 1 then picked3 = picked3 + 1 end
+    if #ph.keywords > 0 then tagged = tagged + 1 end
+  end
+  check(picked3 == 7 and memoPhotos[5].raw.caption == '— papat: メモ5', 'tag failure: pick flags and memos of all photos still written (' .. picked3 .. ')')
+  check(tagged == 0, 'tag failure: the refused tag is not added anywhere')
+  local done3 = lastDialog('message')
+  check(done3 and done3.info:find('タグをキーワードに追加: 0 枚', 1, true) ~= nil
+    and done3.info:find('（3 枚はタグを追加できませんでした）', 1, true) ~= nil, 'tag failure: result shows 3 photos skipped (2, 4, 6 carry the tag)')
+  env.server = savedServer
+end
 
 -- ---------------------------------------------------------------------------
 -- 7. Import: switches off, star sub-collections on

@@ -98,12 +98,31 @@ local function trySet(photo, key, value)
   return ok
 end
 
+--- Append the memo to the photo's caption, one photo on its own: an error reading or writing
+--- the caption skips this photo only (the pick flag, collection and tags of the others go on).
+--- The caption is a *formatted* key in the SDK (getFormattedMetadata); getRawMetadata('caption')
+--- raises 'Unknown key' (1.0.0 – 1.2.2). No yield in here, so a plain pcall is fine.
+--- @return string 'written' | 'unchanged' (already there) | 'failed'
+local function tryAppendMemo(photo, memo)
+  local ok, result = pcall(function()
+    local merged = text.appendMemo(photo:getFormattedMetadata('caption'), memo)
+    if not merged then return 'unchanged' end
+    photo:setRawMetadata('caption', merged)
+    return 'written'
+  end)
+  if not ok then
+    log.warn('caption (memo) skipped for one photo: %s', tostring(result))
+    return 'failed'
+  end
+  return result
+end
+
 --- @param plan table[]    from matching.collectionPlan
 --- @param matched table[] { item, handle }
 --- @param settings table  from config.settings()
 --- @return string status ('executed' | 'queued' | 'aborted'), table summary
 function M.apply(catalog, plan, matched, settings)
-  local summary = { picked = 0, captioned = 0, keyworded = 0, pickFailed = 0 }
+  local summary = { picked = 0, captioned = 0, keyworded = 0, pickFailed = 0, captionFailed = 0, tagFailed = 0 }
 
   local status = catalog:withWriteAccessDo('papat のセレクトを反映', function()
     local sets = {}
@@ -148,18 +167,29 @@ function M.apply(catalog, plan, matched, settings)
       end
 
       if settings.applyMemo and item.memo ~= '' then
-        local merged = text.appendMemo(photo:getRawMetadata('caption'), item.memo)
-        if merged and trySet(photo, 'caption', merged) then
+        local outcome = tryAppendMemo(photo, item.memo)
+        if outcome == 'written' then
           summary.captioned = summary.captioned + 1
+        elseif outcome == 'failed' then
+          summary.captionFailed = summary.captionFailed + 1
         end
       end
 
       if settings.applyTags and #item.tags > 0 then
-        for _, tag in ipairs(item.tags) do
-          local kw = keywordFor(tag)
-          if kw then photo:addKeyword(kw) end
+        -- one photo on its own, like the caption: a keyword Lightroom refuses skips this
+        -- photo's tags only. No yield in here, so a plain pcall is fine.
+        local okTags, errTags = pcall(function()
+          for _, tag in ipairs(item.tags) do
+            local kw = keywordFor(tag)
+            if kw then photo:addKeyword(kw) end
+          end
+        end)
+        if okTags then
+          summary.keyworded = summary.keyworded + 1
+        else
+          log.warn('tags skipped for one photo: %s', tostring(errTags))
+          summary.tagFailed = summary.tagFailed + 1
         end
-        summary.keyworded = summary.keyworded + 1
       end
     end
   end)

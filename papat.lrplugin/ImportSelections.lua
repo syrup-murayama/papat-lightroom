@@ -283,8 +283,18 @@ local function run(context)
       done[#done + 1] = string.format('  （%d 枚は採用フラグを付けられませんでした）', summary.pickFailed)
     end
   end
-  if settings.applyMemo then done[#done + 1] = string.format('メモを説明に追記: %d 枚', summary.captioned) end
-  if settings.applyTags then done[#done + 1] = string.format('タグをキーワードに追加: %d 枚', summary.keyworded) end
+  if settings.applyMemo then
+    done[#done + 1] = string.format('メモを説明に追記: %d 枚', summary.captioned)
+    if summary.captionFailed > 0 then
+      done[#done + 1] = string.format('  （%d 枚は説明にメモを追記できませんでした）', summary.captionFailed)
+    end
+  end
+  if settings.applyTags then
+    done[#done + 1] = string.format('タグをキーワードに追加: %d 枚', summary.keyworded)
+    if summary.tagFailed > 0 then
+      done[#done + 1] = string.format('  （%d 枚はタグを追加できませんでした）', summary.tagFailed)
+    end
+  end
   if #result.unmatched + #result.ambiguous > 0 then
     done[#done + 1] = string.format(
       '反映しなかった写真: %d 枚（見つからない %d・複数一致 %d）',
