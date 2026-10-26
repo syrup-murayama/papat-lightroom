@@ -13,8 +13,13 @@
     * re-running an import does not duplicate collections, keywords or caption text.
 
   Call from an async task. Catalog writes happen inside withWriteAccessDo /
-  withPrivateWriteAccessDo; nothing that yields is wrapped in pcall.
+  withPrivateWriteAccessDo. Lightroom's Lua cannot yield through a plain pcall, and many SDK
+  calls yield: everything that is protected here goes through LrTasks.pcall, and what must be
+  read (the existing captions) is read in one batch call BEFORE the write gate, so inside it
+  only setRawMetadata / the keyword calls run.
 ]]
+
+local LrTasks = import 'LrTasks'
 
 local config = dofile(_PLUGIN.path .. '/lib/config.lua')
 local text = dofile(_PLUGIN.path .. '/lib/text.lua')
@@ -93,28 +98,42 @@ end
 -- ---------------------------------------------------------------------------
 
 local function trySet(photo, key, value)
-  local ok, err = pcall(photo.setRawMetadata, photo, key, value)
+  local ok, err = LrTasks.pcall(photo.setRawMetadata, photo, key, value)
   if not ok then log.warn('setRawMetadata(%s) failed: %s', key, tostring(err)) end
   return ok
 end
 
---- Append the memo to the photo's caption, one photo on its own: an error reading or writing
---- the caption skips this photo only (the pick flag, collection and tags of the others go on).
---- The caption is a *formatted* key in the SDK (getFormattedMetadata); getRawMetadata('caption')
---- raises 'Unknown key' (1.0.0 – 1.2.2). No yield in here, so a plain pcall is fine.
---- @return string 'written' | 'unchanged' (already there) | 'failed'
-local function tryAppendMemo(photo, memo)
-  local ok, result = pcall(function()
-    local merged = text.appendMemo(photo:getFormattedMetadata('caption'), memo)
-    if not merged then return 'unchanged' end
-    photo:setRawMetadata('caption', merged)
-    return 'written'
+--- The captions the photos have now, read in one batch call (outside the write gate).
+--- The caption is a *formatted* key in the SDK; getRawMetadata('caption') raises 'Unknown key'
+--- (1.0.0 – 1.2.2), and photo:getFormattedMetadata yields, so it cannot be called one photo at a
+--- time inside a plain pcall or the write gate (1.2.3 skipped every memo for that reason).
+--- @return table|nil captions  [photo] = { caption = string|nil }; nil when the batch read itself failed
+local function readCaptions(catalog, photos)
+  if #photos == 0 then return {} end
+  local ok, result = LrTasks.pcall(function()
+    return catalog:batchGetFormattedMetadata(photos, { 'caption' })
   end)
-  if not ok then
-    log.warn('caption (memo) skipped for one photo: %s', tostring(result))
-    return 'failed'
+  if not ok or type(result) ~= 'table' then
+    log.warn('captions could not be read, memos are skipped: %s', tostring(result))
+    return nil
   end
   return result
+end
+
+--- Append the memo to the photo's caption, one photo on its own: an error writing the caption
+--- skips this photo only (the pick flag, collection and tags of the others go on).
+--- @param existing string|nil the caption read before the gate; false when it could not be read
+--- @return string 'written' | 'unchanged' (already there) | 'failed'
+local function tryAppendMemo(photo, existing, memo)
+  if existing == false then return 'failed' end
+  local merged = text.appendMemo(existing, memo)
+  if not merged then return 'unchanged' end
+  local ok, err = LrTasks.pcall(photo.setRawMetadata, photo, 'caption', merged)
+  if not ok then
+    log.warn('caption (memo) skipped for one photo: %s', tostring(err))
+    return 'failed'
+  end
+  return 'written'
 end
 
 --- @param plan table[]    from matching.collectionPlan
@@ -123,6 +142,16 @@ end
 --- @return string status ('executed' | 'queued' | 'aborted'), table summary
 function M.apply(catalog, plan, matched, settings)
   local summary = { picked = 0, captioned = 0, keyworded = 0, pickFailed = 0, captionFailed = 0, tagFailed = 0 }
+
+  -- before the gate: the existing captions of the photos that get a memo
+  local captions = {}
+  if settings.applyMemo then
+    local memoPhotos = {}
+    for _, m in ipairs(matched) do
+      if m.item.memo ~= '' then memoPhotos[#memoPhotos + 1] = m.handle end
+    end
+    captions = readCaptions(catalog, memoPhotos) or false
+  end
 
   local status = catalog:withWriteAccessDo('papat のセレクトを反映', function()
     local sets = {}
@@ -167,7 +196,14 @@ function M.apply(catalog, plan, matched, settings)
       end
 
       if settings.applyMemo and item.memo ~= '' then
-        local outcome = tryAppendMemo(photo, item.memo)
+        local existing = false -- the batch read failed: do not guess, skip the memo
+        if captions then
+          local entry = captions[photo]
+          -- the photo's row is missing from the batch answer: its caption is unknown, and an
+          -- empty one would be overwritten. A row without a caption is an empty caption.
+          if type(entry) == 'table' then existing = entry.caption or '' end
+        end
+        local outcome = tryAppendMemo(photo, existing, item.memo)
         if outcome == 'written' then
           summary.captioned = summary.captioned + 1
         elseif outcome == 'failed' then
@@ -177,8 +213,8 @@ function M.apply(catalog, plan, matched, settings)
 
       if settings.applyTags and #item.tags > 0 then
         -- one photo on its own, like the caption: a keyword Lightroom refuses skips this
-        -- photo's tags only. No yield in here, so a plain pcall is fine.
-        local okTags, errTags = pcall(function()
+        -- photo's tags only (LrTasks.pcall: see the note at the top of this file).
+        local okTags, errTags = LrTasks.pcall(function()
           for _, tag in ipairs(item.tags) do
             local kw = keywordFor(tag)
             if kw then photo:addKeyword(kw) end

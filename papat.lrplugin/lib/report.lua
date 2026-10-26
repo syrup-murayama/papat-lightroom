@@ -24,6 +24,7 @@
 local LrApplication = import 'LrApplication'
 local LrDialogs = import 'LrDialogs'
 local LrSystemInfo = import 'LrSystemInfo'
+local LrTasks = import 'LrTasks'
 
 local function load(name) return dofile(_PLUGIN.path .. '/lib/' .. name .. '.lua') end
 local config = load('config')
@@ -215,7 +216,7 @@ function M.finish(apiKey, c, opts)
   if not apiKey or not c or c.segments == 0 then return end
   if not config.reportStatus().consent then return end
 
-  local ok, err = pcall(function()
+  local ok, err = LrTasks.pcall(function()
     local reasons = {}
     for k, n in pairs(c.reasons) do reasons[k] = n end
 

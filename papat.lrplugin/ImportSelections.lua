@@ -295,6 +295,17 @@ local function run(context)
       done[#done + 1] = string.format('  （%d 枚はタグを追加できませんでした）', summary.tagFailed)
     end
   end
+  -- an option that is switched off in the Plug-in Manager is said so, instead of silently doing nothing
+  local off = {}
+  if not settings.applyPick then off[#off + 1] = '採用フラグ' end
+  if not settings.applyMemo then off[#off + 1] = 'メモ' end
+  if not settings.applyTags then off[#off + 1] = 'タグ' end
+  if #off > 0 then
+    done[#done + 1] = string.format(
+      '設定で OFF のため反映していません: %s（プラグインマネージャーの「セレクト受け取り 反映設定」で変えられます）',
+      table.concat(off, '・')
+    )
+  end
   if #result.unmatched + #result.ambiguous > 0 then
     done[#done + 1] = string.format(
       '反映しなかった写真: %d 枚（見つからない %d・複数一致 %d）',

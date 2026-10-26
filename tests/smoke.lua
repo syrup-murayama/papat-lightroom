@@ -217,8 +217,30 @@ local function resumeTask(co)
   if not ok then error(err, 0) end
   return coroutine.status(co) ~= 'dead'
 end
+-- Lightroom runs Lua 5.1: a plain pcall cannot be yielded across, and many SDK calls yield
+-- (HTTP, photo:getFormattedMetadata, ...). Calling one inside a plain pcall fails with
+-- "Yielding is not allowed within a C or metamethod call" (the 1.2.3 caption and 送信の記録
+-- field logs). LrTasks.pcall is the SDK's pcall that can be yielded across. The fake models this:
+-- the global pcall counts the plain pcalls open in each coroutine, LrTasks.pcall does not, and the
+-- yielding fakes call mustYieldFreely().
+local rawPcall = pcall
+local plainPcalls = setmetatable({}, { __mode = 'k' }) -- coroutine -> open plain pcalls
+local MAIN = {}
+local function coKey() return coroutine.running() or MAIN end
+function pcall(...)
+  local key = coKey()
+  plainPcalls[key] = (plainPcalls[key] or 0) + 1
+  local r = table.pack(rawPcall(...))
+  plainPcalls[key] = plainPcalls[key] - 1
+  return table.unpack(r, 1, r.n)
+end
+local function mustYieldFreely(what)
+  if (plainPcalls[coKey()] or 0) > 0 then
+    error('Yielding is not allowed within a C or metamethod call (' .. what .. ' inside a plain pcall)', 0)
+  end
+end
 modules.LrTasks = {
-  pcall = function(fn, ...) return pcall(fn, ...) end,
+  pcall = function(fn, ...) return rawPcall(fn, ...) end,
   startAsyncTask = function(fn)
     local co = coroutine.create(fn)
     if resumeTask(co) then ready[#ready + 1] = co end
@@ -306,6 +328,7 @@ end
 modules.LrHttp = {
   openUrlInBrowser = function(url) env.opened = url end,
   get = function(url, headers)
+    mustYieldFreely('LrHttp.get')
     local status, body, h = env.server({ method = 'GET', url = url, headers = headers })
     env.requests[#env.requests + 1] = { method = 'GET', url = url, headers = headers }
     local out = h or {}
@@ -313,6 +336,7 @@ modules.LrHttp = {
     return type(body) == 'table' and json.encode(body) or body, out
   end,
   post = function(url, body, headers, method)
+    mustYieldFreely('LrHttp.post')
     local req = { method = method or 'POST', url = url, headers = headers, body = body }
     -- a manifest PUT that waits for the network (the other tasks run meanwhile)
     if env.yieldOnManifest and url:find('manifest%.json$') then
@@ -482,8 +506,9 @@ local function newPhoto(path, props)
     return self.raw[k]
   end
   function photo:getFormattedMetadata(k)
+    mustYieldFreely('photo:getFormattedMetadata')
+    if env.inWriteGate then error('Yielding is not allowed within a C or metamethod call (photo:getFormattedMetadata inside withWriteAccessDo)', 0) end
     if not SDK_FORMATTED_KEYS[k] then error('Unknown key: "' .. tostring(k) .. '"', 2) end
-    if k == 'caption' and self.failCaptionRead then error('simulated: caption cannot be read', 2) end
     local v = (self.fmt or {})[k]
     if v == nil and SDK_SETTABLE_KEYS[k] then v = self.raw[k] end -- what setRawMetadata wrote shows up
     return v
@@ -523,10 +548,14 @@ local function newCatalog(photos)
     return out
   end
   function catalog:batchGetFormattedMetadata(photos2, keys)
+    mustYieldFreely('catalog:batchGetFormattedMetadata')
+    local omit = self.omitFromBatch -- a photo whose row is missing from the answer (a set of photos)
+    if self.failBatchCaption then error('simulated: batch read failed', 2) end
+    if env.inWriteGate then error('Yielding is not allowed within a C or metamethod call (batchGetFormattedMetadata inside withWriteAccessDo)', 0) end
     local out = {}
     for _, p in ipairs(photos2) do
-      out[p] = {}
-      for _, k in ipairs(keys) do out[p][k] = (p.fmt or {})[k] end
+      if not (omit and omit[p]) then out[p] = {} end
+      for _, k in ipairs(keys) do if out[p] then out[p][k] = p:getFormattedMetadata(k) end end
     end
     return out
   end
@@ -538,7 +567,13 @@ local function newCatalog(photos)
     end
     return out
   end
-  function catalog:withWriteAccessDo(_, fn) fn({}); return 'executed' end
+  function catalog:withWriteAccessDo(_, fn)
+    env.inWriteGate = true
+    local ok, err = rawPcall(fn, {})
+    env.inWriteGate = false
+    if not ok then error(err, 0) end
+    return 'executed'
+  end
   function catalog:withPrivateWriteAccessDo(fn) fn({}); return 'executed' end
   function catalog:createCollectionSet(name)
     self.sets[name] = self.sets[name] or { name = name }
@@ -2515,10 +2550,28 @@ do
   local probe = newPhoto('/p/PROBE.NEF')
   local okRaw, errRaw = pcall(probe.getRawMetadata, probe, 'caption')
   check(not okRaw and tostring(errRaw):find('Unknown key: "caption"', 1, true) ~= nil, 'fake photo: getRawMetadata("caption") raises Unknown key (as in Lightroom)')
-  check(pcall(probe.getFormattedMetadata, probe, 'caption') == true, 'fake photo: getFormattedMetadata("caption") is fine')
+  check(modules.LrTasks.pcall(probe.getFormattedMetadata, probe, 'caption') == true, 'fake photo: getFormattedMetadata("caption") is fine')
   check(select(1, pcall(probe.getRawMetadata, probe, 'copyName')) == false, 'fake photo: copyName is not a raw key')
   check(select(1, pcall(probe.getRawMetadata, probe, 'croppedWidth')) == false, 'fake photo: croppedWidth is not a raw key')
   check(select(1, pcall(probe.getFormattedMetadata, probe, 'nonsense')) == false, 'fake photo: unknown formatted key raises')
+end
+
+-- the fake models Lightroom's Lua 5.1: yielding calls fail inside a plain pcall / the write gate
+do
+  local probe = newPhoto('/p/PROBE2.NEF')
+  local plainOk, plainErr = pcall(function() return pcall(probe.getFormattedMetadata, probe, 'caption') end)
+  check(plainOk and select(1, pcall(function()
+    local ok, err = pcall(probe.getFormattedMetadata, probe, 'caption')
+    if not ok then error(err, 0) end
+  end)) == false, 'fake photo: getFormattedMetadata inside a plain pcall raises the Yielding error')
+  local okLr = modules.LrTasks.pcall(probe.getFormattedMetadata, probe, 'caption')
+  check(okLr == true, 'fake photo: ... but is fine inside LrTasks.pcall')
+  local gate = newCatalog({ probe })
+  local gateOk = pcall(function()
+    gate:withWriteAccessDo('x', function() return probe:getFormattedMetadata('caption') end)
+  end)
+  check(gateOk == false, 'fake catalog: getFormattedMetadata inside withWriteAccessDo raises the Yielding error')
+  check(env.inWriteGate == false, 'fake catalog: the gate flag is cleared after an error')
 end
 
 -- 1.2.3: adopted photos with memos (the 2026-10-23 field case: 7 adopted, 5 with a memo, some
@@ -2562,15 +2615,16 @@ do
   local done = lastDialog('message')
   check(done and done.title == 'セレクトを読み込みました' and done.info:find('メモを説明に追記: 5 枚', 1, true) ~= nil
     and done.info:find('追記できませんでした', 1, true) == nil, 'memo import: result says 5 captioned, none skipped')
+  check(done and done.info:find('設定で OFF', 1, true) == nil, 'memo import: no "switched off" line when everything is on')
   check(#activeCatalog.keywords == 2, 'memo import: tags still created (papat + タグ: ' .. #activeCatalog.keywords .. ')')
 
-  -- one photo whose caption cannot be written, one whose caption cannot be read: those two are
+  -- two photos whose caption cannot be written: those two are
   -- skipped and counted; every other photo (pick flag, memo, tag) goes through
   for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.writes = {} end
   memoPhotos[1].raw.caption = 'keep me'
   for i = 2, 5 do memoPhotos[i].raw.caption = nil end
   memoPhotos[2].failCaptionWrite = true
-  memoPhotos[4].failCaptionRead = true
+  memoPhotos[4].failCaptionWrite = true
   run('ImportSelections.lua')
   local picked2 = 0
   for _, ph in ipairs(memoPhotos) do if ph.raw.pickStatus == 1 then picked2 = picked2 + 1 end end
@@ -2585,7 +2639,7 @@ do
 
   -- a keyword Lightroom refuses: only the photos that carry that tag are skipped and counted
   for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.keywords = {} end
-  for i = 1, 7 do memoPhotos[i].failCaptionWrite, memoPhotos[i].failCaptionRead = nil, nil end
+  for i = 1, 7 do memoPhotos[i].failCaptionWrite = nil end
   for i = 2, 5 do memoPhotos[i].raw.caption = nil end
   memoPhotos[1].raw.caption = 'keep me'
   activeCatalog.badKeyword = 'タグ'
@@ -2600,6 +2654,41 @@ do
   local done3 = lastDialog('message')
   check(done3 and done3.info:find('タグをキーワードに追加: 0 枚', 1, true) ~= nil
     and done3.info:find('（3 枚はタグを追加できませんでした）', 1, true) ~= nil, 'tag failure: result shows 3 photos skipped (2, 4, 6 carry the tag)')
+
+  -- the batch read of the existing captions fails: no memo is written blindly (that could
+  -- overwrite a caption), the count says so, and the pick flags / tags are untouched by it
+  activeCatalog.badKeyword = nil
+  activeCatalog.failBatchCaption = true
+  for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.keywords = {} end
+  for i = 2, 5 do memoPhotos[i].raw.caption = nil end
+  memoPhotos[1].raw.caption = 'keep me'
+  run('ImportSelections.lua')
+  local picked4, tagged4 = 0, 0
+  for _, ph in ipairs(memoPhotos) do
+    if ph.raw.pickStatus == 1 then picked4 = picked4 + 1 end
+    if #ph.keywords > 0 then tagged4 = tagged4 + 1 end
+  end
+  check(picked4 == 7 and tagged4 == 3, 'caption read failure: pick flags and tags still written (' .. picked4 .. '/' .. tagged4 .. ')')
+  check(memoPhotos[1].raw.caption == 'keep me' and memoPhotos[3].raw.caption == nil, 'caption read failure: no memo written without knowing the caption')
+  local done4 = lastDialog('message')
+  check(done4 and done4.info:find('メモを説明に追記: 0 枚', 1, true) ~= nil
+    and done4.info:find('（5 枚は説明にメモを追記できませんでした）', 1, true) ~= nil, 'caption read failure: result shows 0 captioned and 5 skipped')
+  activeCatalog.failBatchCaption = nil
+
+  -- the batch answer has no row for one photo: its caption is unknown, so its memo is not written
+  -- (an empty caption assumed there would overwrite what the photographer wrote); the others are
+  for _, ph in ipairs(memoPhotos) do ph.raw.pickStatus = nil; ph.keywords = {} end
+  for i = 2, 5 do memoPhotos[i].raw.caption = nil end
+  memoPhotos[1].raw.caption = 'keep me'
+  activeCatalog.omitFromBatch = { [memoPhotos[1]] = true }
+  run('ImportSelections.lua')
+  check(memoPhotos[1].raw.caption == 'keep me', 'caption row missing: the existing caption is not overwritten')
+  check(memoPhotos[3].raw.caption == '— papat: メモ3' and memoPhotos[5].raw.caption == '— papat: メモ5',
+    'caption row missing: the other photos still get their memo')
+  local done5 = lastDialog('message')
+  check(done5 and done5.info:find('メモを説明に追記: 4 枚', 1, true) ~= nil
+    and done5.info:find('（1 枚は説明にメモを追記できませんでした）', 1, true) ~= nil, 'caption row missing: result shows 4 captioned and 1 skipped')
+  activeCatalog.omitFromBatch = nil
   env.server = savedServer
 end
 
@@ -2613,6 +2702,11 @@ activeCatalog = newCatalog({ fresh, plain2 })
 env.prefs = { locationPromptShown = true, applyPick = false, applyMemo = false, applyTags = false, starCollections = true }
 run('ImportSelections.lua')
 check(fresh.raw.pickStatus == nil and fresh.raw.caption == 'keep me' and #activeCatalog.keywords == 0, 'off: nothing written to photos')
+do
+  local doneOff = lastDialog('message')
+  check(doneOff and doneOff.info:find('設定で OFF のため反映していません: 採用フラグ・メモ・タグ', 1, true) ~= nil,
+    'off: the result says which options are switched off in the Plug-in Manager')
+end
 local names = {}
 for _, c in pairs(activeCatalog.collections) do names[c.name] = #c.photos end
 check(names['採用'] == 2 and names['★3'] == 1 and names['★1'] == 1, 'star sub-collections: 採用 + ★3 + ★1')
