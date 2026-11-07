@@ -475,6 +475,67 @@ eq(#n.items, 1, 'photos variant only adopted')
 eq(n.sid, 'G', 'photos variant gallery id')
 eq(select(2, selections.normalize({ ok = true })) ~= nil, true, 'normalize error')
 
+-- papat.selections/v2 (design §4.1 + a pick:false row + a scope:"all" body)
+local v2 = json.decode([[{"ok":true,"schema":"papat.selections/v2","kind":"current","generated_at":"2026-11-12T03:00:00.000Z",
+  "gallery":{"sid":"k3x9a2","title":"Spring wedding","type":"gallery","expires_at":"2026-11-26T03:00:00.000Z","finalized_at":"2026-11-12T02:40:11.000Z"},
+  "scope":"all","photos_source":"manifest","photos":[
+  {"source_id":"a1b2c3d4","filename":"DSC_0123.jpg","stem":"DSC_0123","pick":true,
+   "reviewer":{"rating":4,"keywords":["Item|Soup","cover candidate"],"keywords_edited":true,"note":"Leave space on the right.\nWarmer skin tone, please."},
+   "photographer":{"rating":3,"keywords":["Item|Soup"]}},
+  {"source_id":"e5f6","filename":"DSC_0124.jpg","stem":"DSC_0124","pick":false,
+   "reviewer":{"rating":2,"keywords":["x"],"keywords_edited":false,"note":"Maybe?"},"photographer":{"rating":0,"keywords":[]}},
+  {"source_id":null,"filename":null,"stem":"DSC_0125","pick":true,
+   "reviewer":{"rating":9,"keywords":[],"keywords_edited":false,"note":""},"future_key":{"a":1}},
+  {"stem":"NO_PICK_KEY","reviewer":{"rating":1,"keywords":[],"note":""}},
+  {"stem":"","pick":true},
+  {"stem":"NO_REVIEWER","pick":true},
+  "junk"]}]])
+n = selections.normalize(v2)
+eq(#n.items, 3, 'v2 only pick=true rows (pick=false, missing pick, empty stem, junk dropped)')
+eq(n.items[3].stem .. n.items[3].rating .. #n.items[3].tags .. n.items[3].memo, 'NO_REVIEWER0' .. '0', 'v2 pick row without reviewer reads as empty')
+eq(n.sid, 'k3x9a2', 'v2 sid from gallery')
+eq(n.title, 'Spring wedding', 'v2 title from gallery')
+eq(n.finalizedAt, '2026-11-12T02:40:11.000Z', 'v2 finalizedAt from gallery')
+eq(n.items[1].sourceId, 'a1b2c3d4', 'v2 source id')
+eq(n.items[1].filename, 'DSC_0123.jpg', 'v2 filename')
+eq(n.items[1].stem, 'DSC_0123', 'v2 stem')
+eq(n.items[1].rating, 4, 'v2 rating is the chooser rating (not photographer.rating)')
+eq(#n.items[1].tags, 2, 'v2 keywords -> tags')
+eq(n.items[1].tags[1], 'Item|Soup', 'v2 keyword kept as the "parent|child" string')
+eq(n.items[1].memo, 'Leave space on the right.\nWarmer skin tone, please.', 'v2 note -> memo')
+eq(n.items[2].sourceId, '', 'v2 null source id')
+eq(n.items[2].rating, 5, 'v2 rating clamp')
+v2.scope = 'picked'
+eq(#selections.normalize(v2).items, 3, 'v2 scope makes no difference')
+eq(#selections.normalize(json.decode('{"schema":"papat.selections/v2","gallery":{"sid":"s"},"photos":[]}')).items, 0, 'v2 empty photos')
+eq(select(2, selections.normalize(json.decode('{"schema":"papat.selections/v2","adopted":[{"stem":"A"}]}'))) ~= nil, true, 'v2 without photos is an error')
+
+-- v1 and v2 describing the same choice normalise to the same items
+local v1same = json.decode([[{"schema":"papat.selections/v1","sid":"k3x9a2","title":"Spring wedding","adopted":[
+  {"source_id":"a1b2c3d4","filename":"DSC_0123.jpg","stem":"DSC_0123","adopted":true,"rating":4,"tags":["Item|Soup","cover candidate"],"memo":"Leave space on the right.\nWarmer skin tone, please."},
+  {"source_id":null,"filename":null,"stem":"DSC_0125","adopted":true,"rating":9,"tags":[],"memo":""}]}]])
+local a, b = selections.normalize(v1same), selections.normalize(v2)
+b.items[3] = nil -- the NO_REVIEWER row has no v1 twin
+eq(#a.items, #b.items, 'v1/v2 same count')
+for i = 1, #a.items do
+  local x, y = a.items[i], b.items[i]
+  eq(x.sourceId .. '|' .. x.filename .. '|' .. x.stem .. '|' .. x.rating .. '|' .. table.concat(x.tags, ',') .. '|' .. x.memo,
+    y.sourceId .. '|' .. y.filename .. '|' .. y.stem .. '|' .. y.rating .. '|' .. table.concat(y.tags, ',') .. '|' .. y.memo,
+    'v1/v2 same item ' .. i)
+end
+
+-- unknown / newer schemas stop with a message that says what to do
+local r, e, kind = selections.normalize(json.decode('{"schema":"papat.selections/v3","photos":[{"stem":"A","pick":true}]}'))
+eq(r, nil, 'v3 refused')
+eq(kind, 'schema', 'v3 error kind')
+eq(e:find('papat のプラグインを新しい版にしてください', 1, true) ~= nil and e:find('papat.selections/v3', 1, true) ~= nil, true, 'v3 message')
+r, e, kind = selections.normalize(json.decode('{"schema":"papat.adopted-list/v1","adopted":[{"stem":"A"}]}'))
+eq(r, nil, 'other schema refused')
+eq(kind, 'schema', 'other schema error kind')
+eq(e:find('papat.adopted-list/v1', 1, true) ~= nil, true, 'other schema message shows the schema')
+r, e, kind = selections.normalize(json.decode('{"schema":7,"adopted":[{"stem":"A"}]}'))
+eq(r, nil, 'non-string schema refused')
+
 -- matching ------------------------------------------------------------------
 local function item(o)
   return { sourceId = o.sourceId or '', filename = o.filename or '', stem = o.stem or text.stemOf(o.filename or ''),

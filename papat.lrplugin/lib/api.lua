@@ -447,9 +447,15 @@ function M.sendReport(apiKey, body)
   })
 end
 
+--- 1.2.5: asks for the Lightroom-worded shape (papat.selections/v2). A server that does not know
+--- the parameter ignores it and answers papat.selections/v1; lib/selections.lua decides how to
+--- read the body from the `schema` that actually came back, so either server works.
+M.SELECTIONS_SCHEMA = 'papat.selections/v2'
+
 function M.getSelections(apiKey, sid)
   return withRetry(function()
-    return request('GET', '/galleries/' .. text.urlEncodeSegment(sid) .. '/selections', apiKey)
+    return request('GET', '/galleries/' .. text.urlEncodeSegment(sid) .. '/selections?schema='
+      .. M.SELECTIONS_SCHEMA, apiKey)
   end, 'selections')
 end
 

@@ -191,10 +191,11 @@ local function run(context)
     ui.showApiError('セレクト結果を取得できませんでした', selRes)
     return
   end
-  local selection, parseErr = selections.normalize(selRes.data)
+  local selection, parseErr, errKind = selections.normalize(selRes.data)
   if not selection then
     progress:done()
-    LrDialogs.message('セレクト結果を読み込めませんでした', parseErr .. ' プラグインを最新版に更新してください。', 'critical')
+    LrDialogs.message('セレクト結果を読み込めませんでした',
+      errKind == 'schema' and parseErr or (parseErr .. ' プラグインを最新版に更新してください。'), 'critical')
     return
   end
   if #selection.items == 0 then

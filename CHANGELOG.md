@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.5
+
+- 使用許諾：第3版のまま（この版の直しによる変更はなし）
+- **選んだ結果を新しい形で受け取るようにしました。古い形も読めます**（「セレクトを読み込む」の見た目と、カタログに
+  書く内容は変わりません。採用フラグ・コレクション・メモの追記・タグのキーワードは、これまでと同じです）。
+  採用かどうかは、写真ごとの pick（選ばれたか）だけで決めます。選ばれていない写真は、結果に載っていても採用に
+  数えません。クライアントの★は、Lightroom の★に書き込みません（これまでどおり）
+- このプラグインが読めない形の結果が届いたときは、読み込まずに「papat のプラグインを新しい版にしてください」と
+  表示して止まります（何も書き込みません）
+
+### English
+
+- License: still edition 3 (no change in this release)
+- **The plug-in now receives the client's selections in the new format, and still reads the old one.** What you see when
+  importing and what is written to the catalog are unchanged (pick flag, collection, notes appended to the caption,
+  tags as keywords). Whether a photo counts as selected is decided only by its `pick` value: a photo that is listed
+  but not picked is not imported. The client's star rating is never written to Lightroom's ratings (as before)
+- If a result arrives in a format this version cannot read, the plug-in stops without writing anything and asks you to
+  update it
+
 ## 1.2.4
 
 - 使用許諾：第3版のまま（この版の直しによる変更はなし）

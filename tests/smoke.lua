@@ -2499,7 +2499,7 @@ env.server = function(req)
       { sid = 'SIDX', title = '春の撮影', status = 'active', created_at = iso(-1), expires_at = iso(6), photos = 10 },
     } }
   end
-  if req.url:find('/selections$') then
+  if req.url:find('/selections%?schema=papat.selections/v2$') then
     return 200, { ok = true, schema = 'papat.selections/v1', sid = 'SIDX', title = '春の撮影', adopted = {
       { source_id = 'u-A', filename = 'IMG_0001.jpg', stem = 'IMG_0001', adopted = true, rating = 3, tags = { '表紙' }, memo = '余白' },
       { stem = 'LEGACY_07', adopted = true, rating = 1, tags = {}, memo = '' },
@@ -2597,7 +2597,7 @@ do
         { sid = 'SIDM', title = 'ショートリスト', status = 'active', created_at = iso(-1), expires_at = iso(6), photos = 10 },
       } }
     end
-    if req.url:find('/selections$') then
+    if req.url:find('/selections%?schema=papat.selections/v2$') then
       return 200, { ok = true, schema = 'papat.selections/v1', sid = 'SIDM', title = 'ショートリスト', adopted = adopted }
     end
     return 404, { ok = false, error = 'not found' }
@@ -2689,6 +2689,110 @@ do
   check(done5 and done5.info:find('メモを説明に追記: 4 枚', 1, true) ~= nil
     and done5.info:find('（1 枚は説明にメモを追記できませんでした）', 1, true) ~= nil, 'caption row missing: result shows 4 captioned and 1 skipped')
   activeCatalog.omitFromBatch = nil
+  env.server = savedServer
+end
+
+-- 1.2.5: the same choice delivered as papat.selections/v1 and as /v2 writes the same things into
+-- the catalog; the request carries ?schema=; a server that ignores it (v1 back) still works;
+-- an unknown schema stops with words, writing nothing.
+do
+  local savedServer = env.server
+  local requested = {}
+  local function catalogFor()
+    local ps = {}
+    for i = 1, 3 do
+      local name = string.format('V2_%04d', i)
+      ps[i] = newPhoto('/v/' .. name .. '.NEF', { papatSourceId = 'v-' .. i, papatSid = 'SIDV', papatFilename = name .. '.jpg' })
+      ps[i].raw.rating = i
+      ps[i].raw.label = 'Blue'
+    end
+    ps[1].raw.caption = 'keep me'
+    return ps
+  end
+  local function serveWith(body)
+    env.server = function(req)
+      if req.url:find('/api/v1/galleries$') then
+        return 200, { ok = true, galleries = {
+          { sid = 'SIDV', title = '二段階', status = 'active', created_at = iso(-1), expires_at = iso(6), photos = 10 },
+        } }
+      end
+      if req.url:find('/selections') then
+        requested[#requested + 1] = req.url
+        return 200, body
+      end
+      return 404, { ok = false, error = 'not found' }
+    end
+  end
+  local function snapshot(ps)
+    local out = {}
+    for i, ph in ipairs(ps) do
+      out[i] = table.concat({ tostring(ph.raw.pickStatus), tostring(ph.raw.caption), tostring(ph.raw.rating), tostring(ph.raw.label),
+        table.concat((function() local t = {} for _, k in ipairs(ph.keywords) do t[#t + 1] = tostring(k.name or k) end return t end)(), ',') }, '|')
+    end
+    return table.concat(out, '\n')
+  end
+  local v1body = { ok = true, schema = 'papat.selections/v1', sid = 'SIDV', title = '二段階', adopted = {
+    { source_id = 'v-1', filename = 'V2_0001.jpg', stem = 'V2_0001', adopted = true, rating = 5, tags = { '表紙' }, memo = '余白' },
+    { source_id = 'v-2', filename = 'V2_0002.jpg', stem = 'V2_0002', adopted = true, rating = 0, tags = {}, memo = '' },
+  } }
+  local v2body = { ok = true, schema = 'papat.selections/v2', kind = 'current', scope = 'all', photos_source = 'manifest',
+    gallery = { sid = 'SIDV', title = '二段階', type = 'gallery', finalized_at = iso(-1) }, photos = {
+    { source_id = 'v-1', filename = 'V2_0001.jpg', stem = 'V2_0001', pick = true,
+      reviewer = { rating = 5, keywords = { '表紙' }, keywords_edited = true, note = '余白' }, photographer = { rating = 1, keywords = {} } },
+    { source_id = 'v-2', filename = 'V2_0002.jpg', stem = 'V2_0002', pick = true,
+      reviewer = { rating = 0, keywords = {}, keywords_edited = false, note = '' }, photographer = { rating = 0, keywords = {} } },
+    { source_id = 'v-3', filename = 'V2_0003.jpg', stem = 'V2_0003', pick = false,
+      reviewer = { rating = 4, keywords = { '落選' }, keywords_edited = true, note = '使わない' }, photographer = { rating = 4, keywords = {} } },
+  } }
+
+  local psV1 = catalogFor()
+  activeCatalog = newCatalog(psV1)
+  env.prefs = { locationPromptShown = true }
+  serveWith(v1body)
+  run('ImportSelections.lua')
+  local snapV1 = snapshot(psV1)
+
+  local psV2 = catalogFor()
+  activeCatalog = newCatalog(psV2)
+  env.prefs = { locationPromptShown = true }
+  serveWith(v2body)
+  run('ImportSelections.lua')
+  local snapV2 = snapshot(psV2)
+
+  check(requested[1] and requested[1]:find('/selections?schema=papat.selections/v2', 1, true) ~= nil, 'v2: the request asks for ?schema=papat.selections/v2')
+  check(psV2[1].raw.pickStatus == 1 and psV2[2].raw.pickStatus == 1 and psV2[3].raw.pickStatus == nil, 'v2: pick flag only on pick=true photos (pick=false is not adopted)')
+  check(psV2[1].raw.caption == 'keep me\n— papat: 余白', 'v2: note appended to the caption after the existing one')
+  check(psV2[3].raw.caption == nil and #psV2[3].keywords == 0, 'v2: the pick=false photo gets no memo and no keyword')
+  check(psV2[1].raw.rating == 1 and psV2[1].raw.label == 'Blue', 'v2: rating / color label untouched (the chooser rating is not written)')
+  check(snapV1 == snapV2, 'v1 and v2 of the same choice write identical content into the catalog')
+  check(#activeCatalog.keywords == 2 and activeCatalog.keywords[1].name == 'papat' and activeCatalog.keywords[2].name == '表紙'
+    and activeCatalog.keywords[2].parent == activeCatalog.keywords[1], 'v2: keyword goes under the "papat" parent, as with v1')
+  local doneV2 = lastDialog('message')
+  check(doneV2 and doneV2.info:find('2 枚をコレクションに追加', 1, true) ~= nil, 'v2: done message counts the two picked photos')
+
+  -- an old server ignores ?schema= and answers v1: read as v1, same result
+  local psOld = catalogFor()
+  activeCatalog = newCatalog(psOld)
+  env.prefs = { locationPromptShown = true }
+  serveWith(v1body)
+  run('ImportSelections.lua')
+  check(snapshot(psOld) == snapV2, 'old server (ignores ?schema, answers v1): same catalog content as v2')
+
+  -- a schema this plug-in cannot read: stops with the update message, writes nothing
+  for _, body in ipairs({
+    { ok = true, schema = 'papat.selections/v3', photos = { { stem = 'V2_0001', pick = true } } },
+    { ok = true, schema = 'papat.something/v1', photos = { { stem = 'V2_0001', pick = true } } },
+  }) do
+    local psX = catalogFor()
+    activeCatalog = newCatalog(psX)
+    env.prefs = { locationPromptShown = true }
+    serveWith(body)
+    run('ImportSelections.lua')
+    local d = lastDialog('message')
+    check(d and d.title == 'セレクト結果を読み込めませんでした' and d.info:find('papat のプラグインを新しい版にしてください', 1, true) ~= nil
+      and d.info:find(body.schema, 1, true) ~= nil, 'unknown schema (' .. body.schema .. '): stops with the update message')
+    check(psX[1].raw.pickStatus == nil and psX[1].raw.caption == 'keep me', 'unknown schema (' .. body.schema .. '): nothing written')
+  end
   env.server = savedServer
 end
 
