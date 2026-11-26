@@ -209,7 +209,7 @@ end
 
 local function request(method, path, apiKey, opts)
   opts = opts or {}
-  local url = config.API_BASE .. path
+  local url = (opts.base or config.API_BASE) .. path
 
   local headers = {
     { field = 'Authorization', value = 'Bearer ' .. apiKey },
@@ -430,6 +430,20 @@ function M.putManifest(apiKey, sid, manifest)
       contentType = 'application/json',
     })
   end, 'manifest')
+end
+
+--- 1.2.6 (add to an existing gallery): the manifest the gallery has now — the file names and
+--- source ids already in it. The v1 API has no read of a file, so this reads the gallery's own
+--- file route (/api/sessions/<sid>/files/manifest.json) with the same API key; nothing is written.
+--- A gallery that has no manifest yet answers 404 "not found": that is an empty gallery, not a
+--- missing one (res.noManifest = true, res.ok = true, res.data = { photos = {} }).
+function M.getManifest(apiKey, sid)
+  local path = '/sessions/' .. text.urlEncodeSegment(sid) .. '/files/manifest.json'
+  local res = withRetry(function() return request('GET', path, apiKey, { base = config.BASE_URL .. '/api' }) end, 'manifest read')
+  if not res.ok and res.status == 404 and type(res.data) == 'table' and res.data.error == 'not found' then
+    return { ok = true, status = 200, data = { photos = {} }, noManifest = true }
+  end
+  return res
 end
 
 --- Close (and purge) a gallery. Used to clean up a gallery that never received a photo.

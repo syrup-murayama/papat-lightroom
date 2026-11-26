@@ -1061,5 +1061,67 @@ do
   end
 end
 
+-- addto (1.2.6: add photos to an existing gallery) -------------------------
+do
+  local addto = load('addto')
+  local now = text.isoToEpoch('2026-11-26T00:00:00.000Z')
+  local list = {
+    { sid = 'a', title = 'Old', status = 'active', created_at = '2026-11-01T01:00:00.000Z', expires_at = '2026-11-28T01:00:00.000Z' },
+    { sid = 'b', title = 'New', status = 'active', created_at = '2026-11-20T01:00:00.000Z', expires_at = '2026-12-03T01:00:00.000Z' },
+    { sid = 'c', title = 'Closed', status = 'closed', created_at = '2026-11-21T01:00:00.000Z', expires_at = '2026-12-04T01:00:00.000Z' },
+    { sid = 'd', title = 'Expired', status = 'active', created_at = '2026-11-10T01:00:00.000Z', expires_at = '2026-11-25T23:59:59.000Z' },
+    { sid = 'e', title = 'No expiry', status = 'active', created_at = '2026-11-05T01:00:00.000Z' },
+    { sid = 'f', title = 'Purged', status = 'purged', created_at = '2026-11-22T01:00:00.000Z', expires_at = '2026-12-05T01:00:00.000Z' },
+    'junk', { title = 'no sid', status = 'active' },
+  }
+  local active = addto.activeGalleries(list, now)
+  local sids = {}
+  for _, g in ipairs(active) do sids[#sids + 1] = g.sid end
+  eq(table.concat(sids, ','), 'b,e,a', 'addto: only open galleries, newest first (closed, purged, expired, junk left out)')
+  eq(#addto.activeGalleries(nil, now), 0, 'addto: nil list')
+  eq(#addto.activeGalleries({ list[3], list[4] }, now), 0, 'addto: nothing open')
+  eq(addto.label(active[1], 9 * 3600), 'New  （11/20 作成・12月3日（木）10:00まで）', 'addto: label shows title, day made, expiry')
+  eq(addto.label({ title = '', createdAt = '', expiresAt = '' }, 0), '（無題）', 'addto: label of an empty gallery')
+
+  local manifest = {
+    title = 'Spring', theme = 'default', credit = 'Studio', groupThreshold = 4, count = 3,
+    photos = {
+      { source_id = 's1', stem = 'IMG_1', filename = 'IMG_1.jpg' },
+      { source_id = 's2', stem = 'IMG_2', filename = 'IMG_2.jpeg' },
+      { stem = 'IMG_3' },
+    },
+  }
+  local ex = addto.existing(manifest)
+  eq(ex.count, 3, 'addto.existing: count')
+  eq(ex.sourceIds.s1 and ex.sourceIds.s2 and not ex.sourceIds.s3, true, 'addto.existing: source ids')
+  local used = {}
+  for _, n in ipairs(ex.usedNames) do used[n:lower()] = true end
+  eq(used['img_1.jpg'] and used['img_2.jpeg'] and used['img_2.jpg'] and used['img_3.jpg'], true,
+    'addto.existing: file names and <stem>.jpg count as taken')
+  eq(ex.title, 'Spring', 'addto.existing: title')
+  local base = addto.base(ex, 'from list')
+  eq(base.title == 'Spring' and base.credit == 'Studio' and base.groupThreshold == 4 and base.theme == 'default', true,
+    'addto.base: the gallery\'s own values')
+  local empty = addto.existing(nil)
+  eq(empty.count, 0, 'addto.existing: nil manifest is empty')
+  local b2 = addto.base(empty, 'from list')
+  eq(b2.title == 'from list' and b2.theme == 'default' and b2.credit == '' and b2.groupThreshold == 3, true,
+    'addto.base: an empty gallery falls back to the list title and the defaults')
+  eq(addto.existing({ photos = {}, count = 7 }).count, 7, 'addto.existing: the larger of count and photos')
+
+  local items = { { sourceId = 's1' }, { sourceId = 'n1' }, { sourceId = 's2' }, { sourceId = 'n2' } }
+  local plan = addto.plan(ex, items, 1000)
+  eq(plan.skipped, 2, 'addto.plan: photos whose source id is in the gallery are skipped')
+  eq(#plan.send, 2, 'addto.plan: the rest is sent')
+  eq(plan.over, nil, 'addto.plan: within the limit')
+  local full = addto.existing({ photos = {}, count = 999 })
+  local over = addto.plan(full, { { sourceId = 'x' }, { sourceId = 'y' } }, 1000)
+  eq(over.over, 1, 'addto.plan: 999 + 2 is one over 1,000')
+  eq(addto.plan(full, { { sourceId = 'x' } }, 1000).over, nil, 'addto.plan: 999 + 1 = 1,000 fits')
+  eq(addto.plan(addto.existing({ photos = { { source_id = 'x', stem = 'a', filename = 'a.jpg' } }, count = 1000 }),
+    { { sourceId = 'x' } }, 1000).over, nil, 'addto.plan: a full gallery and only duplicates is not "over"')
+  eq(addto.plan(full, { { sourceId = 'x' }, { sourceId = 'y' } }, 5000).over, nil, 'addto.plan: the server\'s own limit is used')
+end
+
 print(string.format('%d checks, %d failed', total, failed))
 os.exit(failed == 0 and 0 or 1)

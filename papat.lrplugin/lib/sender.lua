@@ -66,6 +66,9 @@ end
 ---   apiKey, sid, title, keyColor, items = { {photo, sourceId}, ... }, usedNames,
 ---   status (from newStatus), alreadyUploaded (resume), total (gallery size)
 ---   groupsNow (optional) forwarded to pipeline.run as-is (lib/similarity.lua's output table)
+---   append (optional, 1.2.6) true when the photos are added to a gallery that already existed
+---     (AddToGallery.lua): the gallery is never deleted for lack of a rendered photo, and
+---     `base` (its own title / theme / credit / groupThreshold) goes into every manifest
 ---   label (optional) "ギャラリー 1/2" — prefixed to the status line, progress title and the
 ---     per-gallery outcome dialogs (1.2.0's auto-split; omitted, nothing is prefixed)
 local function sendOne(context, a)
@@ -86,7 +89,7 @@ local function sendOne(context, a)
   a.status:set(prefix .. '書き出しと送信を始めます。Lightroom で他の作業を続けられます。', '')
 
   local result = pipeline.run {
-    apiKey = a.apiKey, sid = a.sid, title = a.title, keyColor = a.keyColor,
+    apiKey = a.apiKey, sid = a.sid, title = a.title, keyColor = a.keyColor, base = a.base,
     catalog = catalog, rightsMode = a.rightsMode,
     items = a.items, usedNames = a.usedNames,
     concurrency = pipeline.DEFAULT_CONCURRENCY,
@@ -123,7 +126,9 @@ local function sendOne(context, a)
 
   -- Nothing could even be rendered: do not leave an empty gallery behind.
   local rendered = mine - #result.failedRender
-  if result.uploaded == 0 and already == 0 and rendered <= 0 and not result.canceled and not result.fatal then
+  -- (never for an add: that gallery was there before, with other photos or not)
+  if result.uploaded == 0 and already == 0 and rendered <= 0 and not result.canceled and not result.fatal
+    and not a.append then
     api.deleteGallery(a.apiKey, a.sid)
     jobs.removeJob(a.sid)
     jobs.removeRecent(a.sid)
@@ -139,6 +144,7 @@ local function sendOne(context, a)
 
   local sent = already + result.uploaded
   local summary = prefix .. describeOutcome(result, total, already)
+  if a.append then summary = summary:gsub('送信が完了しました', '追加が完了しました') end
   local noteParts = {}
   if #result.failedRender > 0 then
     noteParts[#noteParts + 1] = string.format('書き出せなかった写真が %d 枚あります。', #result.failedRender)
@@ -175,6 +181,8 @@ local function sendOne(context, a)
   elseif #noteParts > 0 or result.canceled then
     LrDialogs.message(prefix .. 'papat: ' .. (result.canceled and '送信を中止しました' or '一部の写真を送れませんでした'),
       summary .. (#noteParts > 0 and ('\n\n' .. table.concat(noteParts, '\n')) or ''), 'info')
+  elseif a.append then
+    LrDialogs.showBezel(string.format('papat: %d 枚をギャラリーに追加しました', result.uploaded), 4)
   else
     LrDialogs.showBezel(string.format('papat: %s%d 枚の送信が完了しました', prefix, sent), 4)
   end

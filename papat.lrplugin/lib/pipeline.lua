@@ -171,7 +171,11 @@ end
 --- @param o table
 ---   apiKey, sid, title, keyColor ('' = none), catalog
 ---   items        array of { photo, sourceId }
----   usedNames    array of file names already on the server (resume)
+---   usedNames    array of file names already on the server (resume; or the names a gallery
+---                that is being added to already holds, 1.2.6)
+---   base         table|nil  { title, theme, credit, groupThreshold }: sent in every manifest as
+---                the gallery's own values instead of the plug-in's defaults. Set when photos
+---                are added to an existing gallery, so a manifest PUT never changes its title
 ---   concurrency  upload tasks (default 3)
 ---   fast         take the JPEG from the preview (falls back to export per photo)
 ---   isCanceled() -> boolean
@@ -313,14 +317,15 @@ function M.run(o)
   --- may have changed in the browser while the photos were being sent) instead of the one this
   --- send started with. Used by the late pass that only adds the small versions.
   local function manifestBody(photos, complete, opts)
+    local base = o.base or {}
     local m = {
       version = 1,
-      title = o.title,
-      theme = 'default',
+      title = base.title or o.title,
+      theme = base.theme or 'default',
       count = #photos,
       photos = photos,
-      credit = '',
-      groupThreshold = 3,
+      credit = base.credit or '',
+      groupThreshold = base.groupThreshold or 3,
       complete = complete,
     }
     if o.keyColor and o.keyColor ~= '' and not (opts and opts.omitKeyColor) then m.key_color = o.keyColor end

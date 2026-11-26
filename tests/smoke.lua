@@ -3666,6 +3666,263 @@ do
   end
 end
 
+
+-- ---------------------------------------------------------------------------
+-- 1.2.6. Add photos to an existing gallery (AddToGallery.lua)
+--   no POST /galleries · only open galleries are offered · the manifest is read first · the same
+--   source id is not sent twice · names that are taken get "-2" · over 1,000 stops before sending
+-- ---------------------------------------------------------------------------
+do
+  local function findNode(node, kind, found)
+    found = found or {}
+    if type(node) ~= 'table' then return found end
+    local args = node.args or node
+    if node.kind == kind then found[#found + 1] = node end
+    for _, child in ipairs(args) do findNode(child, kind, found) end
+    return found
+  end
+  local function requestsOf(method, pattern)
+    local out = {}
+    for _, r in ipairs(env.requests) do
+      if r.method == method and r.url:find(pattern) then out[#out + 1] = r end
+    end
+    return out
+  end
+  local function resetAdd()
+    env.prefs = { locationPromptShown = true }
+    env.passwords = { apiKey = KEY }
+    env.dialogs, env.requests = {}, {}
+    env.cancelAfter = nil
+    env.exportedCount = 0
+  end
+  local function manifestWith(n, extra)
+    local list = {}
+    for i = 1, n do
+      list[i] = { source_id = 'old-' .. i, stem = string.format('OLD_%04d', i), filename = string.format('OLD_%04d.jpg', i),
+        url = 'photos/x', rating = 0, label = '', keywords = {}, datetime = '', camera = '', group = 1 }
+    end
+    for _, p in ipairs(extra or {}) do list[#list + 1] = p end
+    return { version = 1, title = 'Exist title', theme = 'default', count = #list, photos = list, credit = 'Studio', groupThreshold = 5, complete = true }
+  end
+  local galleriesList = {
+    { sid = 'SIDOLD', title = 'Older', status = 'active', created_at = iso(-5), expires_at = iso(2) },
+    { sid = 'SIDNEW', title = 'Exist title', status = 'active', created_at = iso(-1), expires_at = iso(6) },
+    { sid = 'SIDGONE', title = 'Closed', status = 'closed', created_at = iso(-2), expires_at = iso(5) },
+    { sid = 'SIDLATE', title = 'Expired', status = 'active', created_at = iso(-9), expires_at = iso(-1) },
+  }
+  -- scripted server: the gallery list, the status call, the manifest read, and the PUTs
+  local addState
+  local function addServer(opts)
+    opts = opts or {}
+    addState = { photos = {}, manifests = {} }
+    return function(req)
+      if req.method == 'GET' and req.url:find('/api/v1/galleries$') then
+        if opts.listStatus then return opts.listStatus, { ok = false, code = 'rate_limited', error = 'slow down' } end
+        return 200, { ok = true, galleries = opts.list or galleriesList }
+      end
+      if req.method == 'GET' and req.url:find('/api/v1/integration/status') then
+        return 200, { ok = true, tenant_id = 'tnt9' }
+      end
+      if req.method == 'GET' and req.url:find('/api/sessions/[^/]+/files/manifest%.json$') then
+        if opts.noManifest then return 404, { ok = false, error = 'not found' } end
+        return 200, opts.manifest or manifestWith(0)
+      end
+      if req.method == 'POST' and req.url:find('/galleries$') then error('add must never create a gallery') end
+      if req.method == 'DELETE' then addState.deleted = true; return 200, { ok = true } end
+      if req.method == 'PUT' and req.url:find('/files/photos/') then
+        if opts.putStatus then return opts.putStatus, { ok = false, error = 'session not found or not active' } end
+        addState.photos[#addState.photos + 1] = req.url:match('[^/]*$')
+        return 200, { ok = true }
+      end
+      if req.method == 'PUT' and req.url:find('/files/manifest%.json$') then
+        addState.manifests[#addState.manifests + 1] = json.decode(req.body)
+        return 200, { ok = true }
+      end
+      return 200, { ok = true }
+    end
+  end
+  local function selection(names)
+    local list = {}
+    for _, n in ipairs(names) do list[#list + 1] = newPhoto('/p/' .. n) end
+    return list
+  end
+
+  -- the list: only open galleries, newest first
+  resetAdd()
+  local existing = manifestWith(2, {
+    { source_id = 'sid-browser', stem = 'IMG_0003', filename = 'IMG_0003.jpeg', url = 'photos/y' },
+  })
+  existing.photos[1].filename, existing.photos[1].stem = 'IMG_0002.jpg', 'IMG_0002'
+  photos = selection({ 'IMG_0001.NEF', 'IMG_0002.NEF', 'IMG_0003.NEF', 'IMG_0004.NEF' })
+  photos[1].props.papatSourceId = 'old-2' -- already in the gallery (its manifest says so)
+  photos[1].props.papatSid = 'SIDNEW'
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = existing })
+  run('AddToGallery.lua')
+  local modal
+  for _, dlg in ipairs(env.dialogs) do if dlg.kind == 'modal' and dlg.title:find('既存のギャラリーに追加', 1, true) then modal = dlg end end
+  check(modal ~= nil, 'add: the gallery dialog is shown')
+  local popup = modal and findNode(modal.args.contents, 'popup_menu')[1]
+  local choices = popup and popup.args.items or {}
+  check(#choices == 2, 'add: only the two open galleries are offered (got ' .. #choices .. ')')
+  check(choices[1] and choices[1].value == 'SIDNEW' and choices[2] and choices[2].value == 'SIDOLD',
+    'add: newest first, closed and expired ones left out')
+  check(choices[1] and choices[1].title:find('Exist title', 1, true) ~= nil and choices[1].title:find('作成', 1, true) ~= nil
+    and choices[1].title:find('まで', 1, true) ~= nil, 'add: the choice shows the title, the day it was made and the expiry')
+
+  check(#requestsOf('POST', '/galleries$') == 0, 'add: no gallery is created')
+  local mget = requestsOf('GET', '/api/sessions/SIDNEW/files/manifest%.json$')[1]
+  check(mget ~= nil and headerOf(mget, 'Authorization') == 'Bearer ' .. KEY, 'add: the manifest is read first, with the API key')
+  local sentNames = {}
+  for _, n in ipairs(addState.photos) do sentNames[n] = true end
+  check(sentNames['IMG_0001.jpg'] == nil and sentNames['IMG_0001-2.jpg'] == nil, 'add: the photo that is already in the gallery is not sent')
+  check(sentNames['IMG_0002-2.jpg'] and not sentNames['IMG_0002.jpg'], 'add: a name the gallery uses gets -2 (nothing is overwritten)')
+  check(sentNames['IMG_0003-2.jpg'] and not sentNames['IMG_0003.jpg'], 'add: the stem of another extension counts as taken')
+  check(sentNames['IMG_0004.jpg'], 'add: a free name stays as it is')
+  check(#addState.photos == 3, 'add: exactly the 3 new photos are sent (' .. #addState.photos .. ')')
+  local last = addState.manifests[#addState.manifests]
+  check(last and last.complete == true, 'add: the last manifest is complete')
+  check(last and last.title == 'Exist title' and last.credit == 'Studio' and last.groupThreshold == 5,
+    'add: manifests keep the gallery\'s own title / credit / group threshold')
+  check(last and last.key_color == nil, 'add: no key_color is sent (the gallery keeps its own)')
+  local entries = {}
+  for _, m in ipairs(addState.manifests) do for _, p in ipairs(m.photos) do entries[p.filename] = p end end
+  check(entries['IMG_0002-2.jpg'] and entries['IMG_0002-2.jpg'].stem == 'IMG_0002-2' and entries['IMG_0002-2.jpg'].source_id ~= nil,
+    'add: the manifest entry has the new name, its stem and a source id')
+  check(entries['IMG_0001.jpg'] == nil, 'add: the skipped photo is not in the manifest PUT either')
+  check(photos[4].props.papatSid == 'SIDNEW' and photos[4].props.papatFilename == 'IMG_0004.jpg'
+    and type(photos[4].props.papatSourceId) == 'string', 'add: the catalog records sid, file name and source id')
+  check(photos[1].props.papatFilename == nil, 'add: the skipped photo\'s record is left alone')
+  check(addState.deleted ~= true, 'add: the gallery is never deleted')
+  local result = lastDialog('modal')
+  local resultTexts = {}
+  for _, node in ipairs(findNode(result and result.args.contents, 'static_text')) do
+    if type(node.args.title) == 'string' then resultTexts[#resultTexts + 1] = node.args.title end
+  end
+  local resultAll = table.concat(resultTexts, '\n')
+  check(resultAll:find('1 枚は、すでに入っているので送りませんでした', 1, true) ~= nil, 'add: the result tells how many were skipped')
+  local urlField = result and findNode(result.args.contents, 'edit_field')[1]
+  check(urlField ~= nil, 'add: the result shows an URL field')
+  check(resultAll:find('パスコード', 1, true) ~= nil and resultAll:find('変わりません', 1, true) ~= nil, 'add: the result says the passcode does not change')
+  local anyPasscodeRow = false
+  for _, node in ipairs(findNode(result and result.args.contents, 'static_text')) do
+    if node.args.title == 'パスコード' then anyPasscodeRow = true end
+  end
+  check(not anyPasscodeRow, 'add: no passcode row in the result')
+  check(#requestsOf('GET', '/api/v1/integration/status') == 1, 'add: the account id is asked once for the URL')
+  local bezelAdd = false
+  for _, dlg in ipairs(env.dialogs) do if dlg.kind == 'bezel' and dlg.title:find('3 枚をギャラリーに追加', 1, true) then bezelAdd = true end end
+  check(bezelAdd, 'add: the quiet bezel says how many were added')
+
+  -- the second half of the check: the gallery is in "最近のギャラリー" -> its counts grow, its URL is used
+  resetAdd()
+  env.passwords.recentGalleries = json.encode({
+    { sid = 'SIDNEW', title = 'Exist title', url = 'https://papat.app/t/abc/s/SIDNEW/', passcode = 'ABC234',
+      expiresAt = iso(6), createdAt = iso(-1), total = 5, uploaded = 5, keyColor = '', complete = true },
+  })
+  photos = selection({ 'IMG_0101.NEF', 'IMG_0102.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(5) })
+  run('AddToGallery.lua')
+  local rec2 = json.decode(env.passwords.recentGalleries)
+  check(rec2[1] and rec2[1].total == 7 and rec2[1].uploaded == 7 and rec2[1].complete == true,
+    'add: "最近のギャラリー" total / uploaded grow by what was added (' .. tostring(rec2[1] and rec2[1].uploaded) .. ')')
+  check(rec2[1] and rec2[1].passcode == 'ABC234', 'add: the stored passcode is kept as it was')
+  check(#requestsOf('GET', '/api/v1/integration/status') == 0, 'add: a gallery in the recent list needs no account id')
+  local result2 = lastDialog('modal')
+  local url2 = result2 and findNode(result2.args.contents, 'edit_field')[1]
+  check(url2 ~= nil, 'add: the URL of a recent gallery is shown')
+
+  -- the same source id sent twice in a row: the second time everything is skipped
+  resetAdd()
+  photos = selection({ 'IMG_0201.NEF', 'IMG_0202.NEF' })
+  photos[1].props.papatSourceId = 'old-1'
+  photos[2].props.papatSourceId = 'old-2'
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(3) })
+  run('AddToGallery.lua')
+  check(#addState.photos == 0 and #addState.manifests == 0, 'add: nothing is sent when every photo is already in')
+  check(lastDialog('message') and lastDialog('message').info:find('すべてこのギャラリーに入っています', 1, true) ~= nil,
+    'add: all-skipped is explained')
+
+  -- over the limit: 998 in the gallery + 3 new = 1,001 -> nothing is sent
+  resetAdd()
+  photos = selection({ 'IMG_0301.NEF', 'IMG_0302.NEF', 'IMG_0303.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(998) })
+  run('AddToGallery.lua')
+  local over = lastDialog('message')
+  check(over ~= nil and over.title:find('上限', 1, true) ~= nil and over.info:find('998', 1, true) ~= nil
+    and over.info:find('1 枚超え', 1, true) ~= nil, 'add: over 1,000 stops with the numbers')
+  check(#addState.photos == 0 and #addState.manifests == 0, 'add: over 1,000 sends nothing')
+  -- exactly 1,000 is fine
+  resetAdd()
+  photos = selection({ 'IMG_0401.NEF', 'IMG_0402.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(998) })
+  run('AddToGallery.lua')
+  check(#addState.photos == 2, 'add: 998 + 2 = 1,000 is allowed')
+  -- duplicates do not count against the limit
+  resetAdd()
+  photos = selection({ 'IMG_0501.NEF', 'IMG_0502.NEF', 'IMG_0503.NEF' })
+  photos[1].props.papatSourceId = 'old-1'
+  photos[2].props.papatSourceId = 'old-2'
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(998) })
+  run('AddToGallery.lua')
+  check(#addState.photos == 1, 'add: photos already in the gallery do not count toward 1,000')
+
+  -- no open gallery: expired / closed ones are refused before anything else
+  resetAdd()
+  photos = selection({ 'IMG_0601.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ list = { galleriesList[3], galleriesList[4] } })
+  run('AddToGallery.lua')
+  check(lastDialog('message') and lastDialog('message').title:find('追加できるギャラリーがありません', 1, true) ~= nil,
+    'add: no open gallery -> explained')
+  check(#requestsOf('GET', 'manifest%.json') == 0 and #requestsOf('PUT', '.') == 0, 'add: no open gallery -> no manifest read, no PUT')
+
+  -- the list cannot be read (rate limit): an error, nothing else
+  resetAdd()
+  env.server = addServer({ listStatus = 429 })
+  run('AddToGallery.lua')
+  check(lastDialog('message') and lastDialog('message').info:find('リクエストが集中', 1, true) ~= nil, 'add: a rate-limited list shows the rate-limit text')
+  check(#requestsOf('PUT', '.') == 0, 'add: a failed list sends nothing')
+
+  -- a gallery that has no manifest yet is an empty gallery, not an error
+  resetAdd()
+  photos = selection({ 'IMG_0701.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ noManifest = true })
+  run('AddToGallery.lua')
+  check(#addState.photos == 1 and addState.photos[1] == 'IMG_0701.jpg', 'add: a gallery without a manifest takes the photo')
+  check(addState.manifests[#addState.manifests] and addState.manifests[#addState.manifests].title == 'Exist title',
+    'add: with no manifest, the gallery\'s title from the list is used')
+
+  -- the gallery ended meanwhile: the send stops with a message, and the gallery is not deleted
+  resetAdd()
+  photos = selection({ 'IMG_0801.NEF', 'IMG_0802.NEF' })
+  activeCatalog = newCatalog(photos)
+  env.server = addServer({ manifest = manifestWith(1), putStatus = 404 })
+  run('AddToGallery.lua')
+  check(addState.deleted ~= true, 'add: an ended gallery is not deleted (it is not ours to remove)')
+  local ended = false
+  for _, dlg in ipairs(env.dialogs) do
+    if dlg.kind == 'message' and dlg.title:find('送信を中止', 1, true) and dlg.info:find('ギャラリーが見つかりません', 1, true) then ended = true end
+  end
+  check(ended, 'add: an ended gallery is explained')
+
+  -- selection of videos only / nothing selected
+  resetAdd()
+  photos = selection({ 'MOV_0001.MOV' })
+  photos[1].raw.isVideo = true
+  activeCatalog = newCatalog(photos)
+  env.server = addServer()
+  run('AddToGallery.lua')
+  check(lastDialog('message') and lastDialog('message').title:find('動画は送れません', 1, true) ~= nil, 'add: videos only is refused')
+  check(#requestsOf('GET', '/galleries$') == 0, 'add: videos only does not ask the server')
+end
+
 print(string.format('%d smoke checks, %d failed', total, failed))
 os.execute('rm -rf "' .. tmpRoot .. '"')
 os.exit(failed == 0 and 0 or 1)

@@ -7,11 +7,15 @@ return {
   LrPluginInfoProvider = 'PluginInfoProvider.lua',
   LrMetadataProvider = 'Metadata.lua',
   LrMetadataTagsetFactory = 'Tagset.lua',
-  VERSION = { major = 1, minor = 2, revision = 5, build = 0 },
+  VERSION = { major = 1, minor = 2, revision = 6, build = 0 },
   LrLibraryMenuItems = {
     {
       title = 'papat でギャラリーを作る…',
       file = 'CreateGallery.lua',
+    },
+    {
+      title = 'papat の既存のギャラリーに追加…',
+      file = 'AddToGallery.lua',
     },
     {
       title = 'papat のセレクトを読み込む…',

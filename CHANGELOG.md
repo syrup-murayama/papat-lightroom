@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.6
+
+- 使用許諾：第3版のまま（この版の変更による変更はなし）
+- **すでにあるギャラリーに、写真を追加できるようになりました**。メニュー「papat の既存のギャラリーに追加…」で、
+  公開中のギャラリーを選んで送ります。タイトル・公開期限・パスコードは変わりません。そのギャラリーにすでに入っている
+  写真は送らず、同じファイル名があるときは `-2` のように名前をずらします。1 つのギャラリーの上限（1,000 枚）を
+  超えるときは、送る前に止めてお知らせします。追加した写真の似た写真のまとめは、撮影時刻だけで分けます
+
+### English
+
+- License: still edition 3 (no change in this release)
+- **You can now add photos to a gallery that already exists.** Use the menu "papat の既存のギャラリーに追加…" (add to an
+  existing gallery), pick one of your open galleries and send. Its title, expiry and passcode do not change. Photos that are
+  already in the gallery are not sent again, and a file name that is already used gets a suffix such as `-2`. If the
+  gallery would go over its limit (1,000 photos), the plug-in stops before sending anything and tells you. The added photos
+  are grouped by capture time only (no similar-photo grouping)
+
 ## 1.2.5
 
 - 使用許諾：第3版のまま（この版の直しによる変更はなし）
